@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{% block title %}enfekte.co{% endblock %}</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <style>
+    header.nav { margin-bottom: 1rem; }
+    .avatar { width: 28px; height: 28px; border-radius: 50%; object-fit: cover; vertical-align: middle; }
+    .grid-3 { display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 1rem; }
+    .grid-2 { display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 1rem; }
+    .tag { background:#eef; padding: .2rem .5rem; border-radius:.5rem; font-size:.85rem; }
+    .muted { color:#666; font-size:.9rem; }
+    .btn-row { display:flex; gap:.5rem; flex-wrap:wrap; }
+    .notice { padding:.6rem .8rem; border:1px solid #ddd; border-radius:.5rem; background:#fafafa; }
+    img.qr { width: 260px; height: 260px; }
+    .chip { display:inline-flex; align-items:center; gap:.5rem; padding:.3rem .6rem; border:1px solid #ddd; border-radius:1rem; }
+  </style>
+</head>
+<body>
+  <header class="container nav">
+    <nav>
+      <ul>
+        <li><strong><a href="{{ url_for('index') }}">enfekte.co</a></strong></li>
+      </ul>
+      <ul>
+        {% if user %}
+          <li><a href="{{ url_for('dashboard') }}">Panel</a></li>
+          <li><a href="{{ url_for('logout') }}">Çıkış</a></li>
+          <li>
+            {% if user.avatar_url %}
+              <img class="avatar" src="{{ user.avatar_url }}" alt="avatar" />
+            {% endif %}
+            {{ user.name or 'Kullanıcı' }}
+          </li>
+        {% else %}
+          <li><a href="{{ url_for('li_login', next=request.url) }}">LinkedIn ile Giriş</a></li>
+        {% endif %}
+      </ul>
+    </nav>
+  </header>
+
+  <main class="container">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div>
+          {% for cat, msg in messages %}
+            <blockquote class="notice" data-intent="{{ cat }}">{{ msg|safe }}</blockquote>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>
+

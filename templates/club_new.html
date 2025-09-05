@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Yeni Kulüp • enfekte.co{% endblock %}
+{% block content %}
+  <h3>Yeni Kulüp Oluştur</h3>
+  <form method="post" action="{{ url_for('club_new_post') }}">
+    <label for="name">Kulüp adı</label>
+    <input id="name" name="name" required placeholder="Örn: İTÜ Yapay Zeka Kulübü" />
+    <button type="submit">Oluştur</button>
+  </form>
+{% endblock %}
+

@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}{{ club.name }} • Kulüp Paneli{% endblock %}
+{% block content %}
+  <h3>{{ club.name }}</h3>
+  <p class="muted">Kuruluş: {{ club.created_at|ts }}</p>
+
+  {% if owner %}
+    <div class="btn-row">
+      <a role="button" href="{{ url_for('event_new', club_id=club.id) }}">+ Etkinlik Oluştur</a>
+      <a role="button" href="{{ url_for('community_graph', club_id=club.id) }}">Topluluk Ağı</a>
+    </div>
+  {% else %}
+    <div class="btn-row">
+      <a role="button" href="{{ url_for('community_graph', club_id=club.id) }}">Topluluk Ağı</a>
+    </div>
+  {% endif %}
+
+  <h4>Etkinlikler</h4>
+  {% if events %}
+    <div class="grid-2">
+      {% for e in events %}
+        <article>
+          <header><strong>{{ e.title }}</strong></header>
+          <p class="muted">
+            Başlangıç: {{ e.starts_at|ts }} • Bitiş: {{ e.ends_at|ts }} <br/>
+            Yoklama: <strong>{{ e.checkin_count }}</strong>
+          </p>
+          {% if owner %}
+            <footer>
+              <a role="button" href="{{ url_for('event_live', event_id=e.id) }}">Canlı QR Ekranı</a>
+            </footer>
+          {% endif %}
+        </article>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p>Henüz etkinlik yok.</p>
+  {% endif %}
+
+  <h4>Üyeler</h4>
+  <div class="grid-3">
+    {% for m in members %}
+      <div class="chip">
+        {% if m.avatar_url %}<img class="avatar" src="{{ m.avatar_url }}"/>{% endif %}
+        <span>{{ m.name }}</span>
+        <span class="tag">{{ m.role }}</span>
+        {% if m.id != user.id %}
+          <form method="post" action="{{ url_for('connect_send', club_id=club.id, target_id=m.id) }}">
+            <button type="submit">Tanıyorum</button>
+          </form>
+        {% endif %}
+      </div>
+    {% endfor %}
+  </div>
+
+  {% if incoming %}
+    <h4>Bekleyen Bağ İstekleri</h4>
+    {% for r in incoming %}
+      <div class="chip">
+        {% if r.avatar_url %}<img class="avatar" src="{{ r.avatar_url }}"/>{% endif %}
+        <span>{{ r.name }}</span>
+        <form method="post" action="{{ url_for('connect_accept', club_id=club.id) }}">
+          <input type="hidden" name="from_id" value="{{ r.src_user_id }}" />
+          <button type="submit">Kabul Et</button>
+        </form>
+      </div>
+    {% endfor %}
+  {% endif %}
+{% endblock %}
+

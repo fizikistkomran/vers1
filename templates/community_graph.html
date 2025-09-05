@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}Topluluk Ağı • enfekte.co{% endblock %}
+{% block content %}
+  <h3>Topluluk Ağı</h3>
+  <p class="muted">Bağ oluşturmak için kulüp panelinden “Tanıyorum” gönder, gelen istekleri kabul et.</p>
+
+  <div id="graph" style="width:100%; height:550px; border:1px solid #eee; border-radius:8px;"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+  <script>
+    const width = document.getElementById('graph').clientWidth;
+    const height = document.getElementById('graph').clientHeight;
+
+    const svg = d3.select("#graph").append("svg")
+      .attr("width", width).attr("height", height);
+
+    const g = svg.append("g");
+
+    function avatarPattern(svg, id, href) {
+      const defs = svg.append("defs");
+      const pat = defs.append("pattern")
+        .attr("id", id)
+        .attr("width", 1).attr("height", 1)
+        .attr("patternContentUnits", "objectBoundingBox");
+      pat.append("image")
+        .attr("href", href)
+        .attr("preserveAspectRatio","xMidYMid slice")
+        .attr("width", 1).attr("height", 1);
+    }
+
+    fetch("{{ url_for('club_graph_json', club_id=club_id) }}")
+      .then(r => r.json())
+      .then(data => {
+        const nodes = data.nodes.map(d => ({...d}));
+        const links = data.edges.map(e => ({...e}));
+
+        links.forEach(l => {
+          l.source = nodes.find(n => n.id === l.source);
+          l.target = nodes.find(n => n.id === l.target);
+        });
+
+        nodes.forEach(n => {
+          if (n.avatar) avatarPattern(svg, "avatar-"+n.id, n.avatar);
+        });
+
+        const sim = d3.forceSimulation(nodes)
+          .force("link", d3.forceLink(links).id(d => d.id).distance(120))
+          .force("charge", d3.forceManyBody().strength(-180))
+          .force("center", d3.forceCenter(width/2, height/2));
+
+        const link = g.selectAll(".link")
+          .data(links).enter().append("line")
+          .attr("class","link")
+          .attr("stroke","#ccc").attr("stroke-width",1.5);
+
+        const node = g.selectAll(".node")
+          .data(nodes).enter().append("g")
+          .attr("class","node")
+          .call(d3.drag()
+            .on("start", (event,d)=>{ if(!event.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; })
+            .on("drag",  (event,d)=>{ d.fx=event.x; d.fy=event.y; })
+            .on("end",   (event,d)=>{ if(!event.active) sim.alphaTarget(0); d.fx=null; d.fy=null; }));
+
+        node.append("circle")
+          .attr("r", 18)
+          .attr("fill", d => d.avatar ? `url(#avatar-${d.id})` : "#89a")
+          .attr("stroke","#333").attr("stroke-width",0.5);
+
+        node.append("text")
+          .attr("x", 22).attr("y", 4)
+          .text(d => d.label)
+          .attr("font-size","12px");
+
+        sim.on("tick", () => {
+          link
+            .attr("x1", d => d.source.x)
+            .attr("y1", d => d.source.y)
+            .attr("x2", d => d.target.x)
+            .attr("y2", d => d.target.y);
+
+          node.attr("transform", d => `translate(${d.x},${d.y})`);
+        });
+      });
+  </script>
+{% endblock %}
+

@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Canlı QR • {{ event.title }}{% endblock %}
+{% block content %}
+  <h3>{{ event.title }} • Canlı Yoklama</h3>
+  <p class="muted">Kulüp: {{ club.name }}</p>
+
+  <article>
+    <header><strong>QR Kod</strong></header>
+    <img class="qr" src="{{ url_for('event_qr_png', event_id=event.id) }}" alt="QR" />
+    <p class="muted">Link: <code>{{ join_url }}</code></p>
+  </article>
+
+  <article>
+    <header><strong>Canlı Sayaç</strong></header>
+    <p>Toplam yoklama: <span id="cnt">{{ count }}</span></p>
+  </article>
+
+  <script>
+    async function poll() {
+      try {
+        const res = await fetch("{{ url_for('event_live', event_id=event.id) }}", { headers: { "X-Partial": "1" }});
+        // sadece sayaç için min GET hilesi yerine QR sayfasını yeniden yüklemeyelim
+      } catch(e){}
+      // çok basit: 3 saniyede bir resme cache-bypass veya küçük ping atıp tekrar yükleyelim
+      const c = document.getElementById('cnt');
+      // minicik fetch ile /clubs sayfasına gitmeden sadece count almak için lightweight endpoint yok; 
+      // pratikte burada sayfayı yenilemeyi tercih edelim:
+      setTimeout(()=>location.reload(), 3000);
+    }
+    setTimeout(poll, 3000);
+  </script>
+{% endblock %}
+

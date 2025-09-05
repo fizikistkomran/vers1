@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}enfekte.co · Hoş geldin{% endblock %}
+{% block content %}
+  <div class="grid md:grid-cols-2 gap-6">
+    <section class="bg-white rounded-2xl p-6 shadow-sm">
+      <h1 class="text-2xl font-semibold mb-2">Merhaba! 👋</h1>
+      <p class="text-slate-600">
+        Bu proje, İTÜ kulüpleri için <strong>LinkedIn ile giriş</strong> ve
+        <strong>EDU e-posta doğrulama</strong> akışını içerir (Adım 1).
+      </p>
+      <a href="/auth/linkedin/login"
+         class="inline-flex items-center mt-4 px-4 py-2 rounded-xl bg-black text-white">
+        LinkedIn ile devam et
+      </a>
+    </section>
+
+    <section class="bg-white rounded-2xl p-6 shadow-sm">
+      <h2 class="text-xl font-semibold mb-2">Notlar</h2>
+      <ul class="list-disc pl-6 space-y-1 text-slate-700">
+        <li>Girişten sonra EDU doğrulama istenir.</li>
+        <li>SMTP ayarlı değilse link terminale yazdırılır.</li>
+        <li>HOST_URL: <code>{{ HOST_URL }}</code></li>
+      </ul>
+    </section>
+  </div>
+{% endblock %}
+

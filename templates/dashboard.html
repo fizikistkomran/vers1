@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Panel • enfekte.co{% endblock %}
+{% block content %}
+  <h3>Benim Kulüplerim</h3>
+  <p class="muted">Kulüp oluştur veya bir kulübün etkinliğinde QR okutarak üyeliğin otomatik başlasın.</p>
+  <div class="btn-row">
+    <a role="button" href="{{ url_for('club_new') }}">+ Yeni Kulüp</a>
+  </div>
+  <hr />
+  {% if clubs %}
+    <div class="grid-2">
+      {% for c in clubs %}
+        <article>
+          <header><strong>{{ c.name }}</strong></header>
+          <p>
+            <span class="tag">Üye: {{ c.member_count }}</span>
+            <span class="tag">Etkinlik: {{ c.event_count }}</span>
+            <span class="muted">• {{ c.created_at|ts }}</span>
+          </p>
+          <footer class="btn-row">
+            <a role="button" href="{{ url_for('club_detail', club_id=c.id) }}">Kulüp Paneli</a>
+          </footer>
+        </article>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p>Henüz kulüp yok. <a href="{{ url_for('club_new') }}">İlk kulübünü oluştur.</a></p>
+  {% endif %}
+{% endblock %}
+

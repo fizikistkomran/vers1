@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}EDU Doğrulama • enfekte.co{% endblock %}
+{% block content %}
+  <h3>EDU e-posta doğrulaması</h3>
+  <p class="muted">İzinli alanlar: {{ allowed }}</p>
+  <form method="post" action="{{ url_for('verify_start') }}">
+    <label for="edu_email">EDU e-posta adresin</label>
+    <input type="email" id="edu_email" name="edu_email" placeholder="ad.soyad@itu.edu.tr" required />
+    <button type="submit">Doğrulama bağlantısı gönder</button>
+  </form>
+{% endblock %}
+
