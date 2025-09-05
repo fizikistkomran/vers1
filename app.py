@@ -353,10 +353,50 @@ def create_app():
     app.config["MAX_CONTENT_LENGTH"]      = 12 * 1024 * 1024  # 12MB
 
     # --- DB ---
+    # URL'i normalize et (Railway/SQLAlchemy uyumu)
     DB_URL = os.getenv("DATABASE_URL", "sqlite:///enfekte.db")
+    if DB_URL.startswith("postgres://"):
+        DB_URL = DB_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif DB_URL.startswith("postgresql://") and "+psycopg2" not in DB_URL:
+        DB_URL = DB_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+    if DB_URL.startswith("postgresql+psycopg2://") and "sslmode=" not in DB_URL:
+        sep = "&" if "?" in DB_URL else "?"
+        DB_URL = f"{DB_URL}{sep}sslmode=require"
+
+    pool_size      = int(os.getenv("DB_POOL_SIZE", "5"))
+    max_overflow   = int(os.getenv("DB_MAX_OVERFLOW", "5"))
+    pool_recycle   = int(os.getenv("DB_POOL_RECYCLE", "280"))
     engine = create_engine(
-        DB_URL, echo=False, future=True, pool_pre_ping=True, pool_size=5, max_overflow=5
+        DB_URL,
+        echo=False,
+        future=True,
+        pool_pre_ping=True,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
+        pool_recycle=pool_recycle,
     )
+
+    # İlk bağlantıyı birkaç kez dene (soğuk uyanma)
+    attempts = int(os.getenv("DB_CONNECT_ATTEMPTS", "5"))
+    delay = 1.0
+    last_err = None
+    for i in range(attempts):
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            if DEBUG_TRACE:
+                print(f"[DB] connect attempt {i+1}/{attempts} failed: {e}")
+            if i < attempts - 1:
+                time.sleep(delay)
+                delay = delay + 1 if delay < 3 else delay * 1.6
+    if last_err:
+        # Açık hata; Railway loglarında net görünür
+        raise last_err
+
     create_schema(engine)
     ensure_columns(engine)
 
@@ -903,12 +943,10 @@ def create_app():
         init();
         </script>
         """
-        # Eğer templates'te club_graph.html varsa onu kullanır; yoksa yukarıdaki fallback Jinja ile render edilir
         try:
             return render_template("club_graph.html", user=user, club=club, club_id=club_id, max_ts=int(max_ts))
         except TemplateNotFound:
             return render_template_string(tmpl, user=user, club=club, club_id=club_id, max_ts=int(max_ts))
-
 
     @app.get("/clubs/<int:club_id>/graph.json")
     def club_graph_json(club_id):
