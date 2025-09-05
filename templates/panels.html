@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Panellerim · enfekte.co{% endblock %}
+{% block content %}
+
+<h2 class="section-title">panellerim</h2>
+
+{% if admin_clubs %}
+  <div class="grid">
+    {% for c in admin_clubs %}
+      <a class="card" href="{{ url_for('club_dashboard', club_id=c.id) }}">
+        <div class="club">{{ c.name }}</div>
+        <div class="meta">Yönetici olduğun kulüp</div>
+      </a>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="empty list">Yönetici olduğun kulüp yok.</div>
+{% endif %}
+
+{% endblock %}
+

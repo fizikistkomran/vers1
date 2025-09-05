@@ -41,7 +41,6 @@ def is_postgres(engine) -> bool:
     return engine.dialect.name in ("postgresql", "postgres")
 
 def current_ts_sql(engine) -> str:
-    # tablo default'u için epoch (saniye)
     return "EXTRACT(EPOCH FROM NOW())" if is_postgres(engine) else "strftime('%s','now')"
 
 def create_schema(engine):
@@ -184,10 +183,34 @@ def create_schema(engine):
         for sql in ddl:
             con.exec_driver_sql(sql)
 
+def ensure_event_category_column(engine):
+    """
+    events.category TEXT DEFAULT 'event' sütununu ekler (yoksa).
+    """
+    try:
+        with engine.begin() as con:
+            if is_postgres(engine):
+                con.exec_driver_sql("ALTER TABLE events ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'event'")
+            else:
+                # SQLite: IF NOT EXISTS destekli; eski sürümde hata olursa except ile yut
+                try:
+                    con.exec_driver_sql("ALTER TABLE events ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'event'")
+                except Exception:
+                    # Kolon var ise error yutar; yoksa tekrar deneyelim (bazı sürümlerde IF NOT EXISTS yok)
+                    try:
+                        # Basit kontrol: pragma table_info
+                        cols = con.execute(text("PRAGMA table_info(events)")).fetchall()
+                        names = [c[1] for c in cols]
+                        if "category" not in names:
+                            con.exec_driver_sql("ALTER TABLE events ADD COLUMN category TEXT DEFAULT 'event'")
+                    except Exception:
+                        pass
+    except Exception:
+        if DEBUG_TRACE:
+            print("[WARN] ensure_event_category_column failed")
+            traceback.print_exc()
+
 def insert_with_returning(con, engine, sql_sqlite, sql_pg, params):
-    """
-    ID döndüren insert: SQLite'ta lastrowid, PostgreSQL'de RETURNING.
-    """
     if is_postgres(engine):
         res = con.execute(text(sql_pg), params)
         row = res.fetchone()
@@ -197,27 +220,20 @@ def insert_with_returning(con, engine, sql_sqlite, sql_pg, params):
         return res.lastrowid
 
 def insert_ignore_or_conflict(con, engine, table, columns, values_map, conflict_cols=None, update_map=None):
-    """
-    SQLite: INSERT OR IGNORE / REPLACE
-    Postgres: INSERT ... ON CONFLICT DO NOTHING/UPDATE
-    """
     cols = ", ".join(columns)
     placeholders = ", ".join([f":{k}" for k in values_map.keys()])
 
     if is_postgres(engine):
         if update_map is None:
-            # DO NOTHING
             sql = f"INSERT INTO {table} ({cols}) VALUES ({placeholders}) ON CONFLICT ({', '.join(conflict_cols)}) DO NOTHING"
         else:
             set_clause = ", ".join([f"{k}=EXCLUDED.{k}" for k in update_map.keys()])
             sql = f"INSERT INTO {table} ({cols}) VALUES ({placeholders}) ON CONFLICT ({', '.join(conflict_cols)}) DO UPDATE SET {set_clause}"
         con.execute(text(sql), values_map)
     else:
-        # SQLite tarafı: update_map varsa REPLACE, yoksa IGNORE kullanalım
         if update_map is None:
             sql = f"INSERT OR IGNORE INTO {table} ({cols}) VALUES ({placeholders})"
         else:
-            # REPLACE mevcut satırı silip ekler; burada role/joined_at güncellensin istiyorsak REPLACE iş görür
             sql = f"INSERT OR REPLACE INTO {table} ({cols}) VALUES ({placeholders})"
         con.execute(text(sql), values_map)
 
@@ -241,8 +257,9 @@ def create_app():
         max_overflow=5
     )
 
-    # Şema oluştur (her iki veritabanı için)
+    # Şema oluştur + kategori sütununu ekle
     create_schema(engine)
+    ensure_event_category_column(engine)
 
     serializer = URLSafeTimedSerializer(app.config["SECRET_KEY"])
 
@@ -272,7 +289,7 @@ def create_app():
                     columns=["club_id","user_id","role","joined_at"],
                     values_map={"club_id": club_id, "user_id": user_id, "role": role_default, "joined_at": now_ts()},
                     conflict_cols=["club_id","user_id"],
-                    update_map=None  # DO NOTHING/IGNORE
+                    update_map=None
                 )
 
     def is_admin_or_owner(club_id: int, user_id: int) -> bool:
@@ -293,7 +310,6 @@ def create_app():
         use_tls = (os.getenv("SMTP_USE_TLS","true").lower() == "true")
 
         if not host or not user or not pwd:
-            # Dev modunda e-postayı konsola yaz
             print("\n[DEV] SMTP boş: doğrulama e-postası gönderilmiyor.")
             print("[DEV] TO:", to_email)
             print("[DEV] SUBJECT:", subject)
@@ -317,36 +333,347 @@ def create_app():
     # ---------- Jinja filters ----------
     app.jinja_env.filters["ts"] = ts2human
 
-    # ---------- Routes: temel ----------
+    # ===================== 1) ANASAYFA =====================
+    @app.get("/")
+    def home():
+        """
+        Header butonları: (şablonda yer alacak)
+          - panelim, profil, çıkış vb.
+        Bölümler:
+          - Üyeliklerim (kullanıcının üye olduğu kulüpler)
+          - Kulüplerimin Etkinlik/Toplantıları (yakın tarihten itibaren)
+          - Tüm Kulüplerin Etkinlik/Toplantıları (yakın tarihten itibaren)
+        """
+        user = current_user()
+
+        with engine.begin() as con:
+            my_clubs = []
+            my_events = []
+            all_events = []
+
+            if user:
+                my_clubs = con.execute(text("""
+                  SELECT c.*
+                  FROM clubs c
+                  JOIN club_members m ON m.club_id=c.id
+                  WHERE m.user_id=:u
+                  ORDER BY c.created_at DESC
+                """), {"u": user["id"]}).mappings().all()
+
+                my_events = con.execute(text("""
+                  SELECT e.*, c.name AS club_name
+                  FROM events e 
+                  JOIN clubs c ON c.id=e.club_id
+                  WHERE e.club_id IN (SELECT club_id FROM club_members WHERE user_id=:u)
+                  ORDER BY COALESCE(e.starts_at, e.created_at) DESC
+                  LIMIT 24
+                """), {"u": user["id"]}).mappings().all()
+
+            all_events = con.execute(text("""
+              SELECT e.*, c.name AS club_name
+              FROM events e 
+              JOIN clubs c ON c.id=e.club_id
+              ORDER BY COALESCE(e.starts_at, e.created_at) DESC
+              LIMIT 48
+            """)).mappings().all()
+
+        # Şablonda kategoriye göre gruplama yapabilirsin (event vs meeting)
+        return render_template(
+            "home.html",
+            user=user,
+            my_clubs=my_clubs,
+            my_events=my_events,
+            all_events=all_events
+        )
+
+    # ===================== 2) PROFİL =====================
+    @app.get("/profile")
+    def profile():
+        user = current_user()
+        if not user:
+            return redirect(url_for("home"))
+        with engine.begin() as con:
+            memberships = con.execute(text("""
+              SELECT c.name, c.id, m.role 
+              FROM club_members m JOIN clubs c ON c.id=m.club_id
+              WHERE m.user_id=:u
+              ORDER BY c.name
+            """), {"u": user["id"]}).mappings().all()
+        return render_template("profile.html", user=user, memberships=memberships)
+
+    # ===================== 3) PANELLERİM =====================
+    @app.get("/panellerim")
+    def my_panels():
+        """
+        Kullanıcının owner/admin olduğu kulüpler.
+        """
+        user = current_user()
+        if not user:
+            return redirect(url_for("home"))
+        with engine.begin() as con:
+            admin_clubs = con.execute(text("""
+              SELECT c.*
+              FROM club_members m 
+              JOIN clubs c ON c.id=m.club_id
+              WHERE m.user_id=:u AND m.role IN ('owner','admin')
+              ORDER BY c.created_at DESC
+            """), {"u": user["id"]}).mappings().all()
+        return render_template("panels.html", user=user, admin_clubs=admin_clubs)
+
+    # ===================== 4) KULÜP PANELİ =====================
+    @app.get("/clubs/<int:club_id>")
+    def club_dashboard(club_id):
+        """
+        Genel bilgiler + 'Kulüp Analizi' butonu + Toplantılar/Etkinlikler listesi
+        """
+        user = current_user()
+        if not user:
+            return redirect(url_for("home"))
+
+        with engine.begin() as con:
+            club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": club_id}).mappings().first()
+            if not club:
+                abort(404)
+
+            # Üyeler + rol
+            members = con.execute(text("""
+              SELECT u.id, u.name, u.avatar_url, m.role
+              FROM club_members m JOIN users u ON u.id=m.user_id
+              WHERE m.club_id=:c
+              ORDER BY u.name
+            """), {"c": club_id}).mappings().all()
+
+            # Toplantılar / Etkinlikler
+            meetings = con.execute(text("""
+              SELECT e.*, COALESCE(e.starts_at, e.created_at) AS tkey
+              FROM events e WHERE e.club_id=:c AND COALESCE(e.category,'event')='meeting'
+              ORDER BY tkey DESC
+            """), {"c": club_id}).mappings().all()
+
+            events = con.execute(text("""
+              SELECT e.*, COALESCE(e.starts_at, e.created_at) AS tkey
+              FROM events e WHERE e.club_id=:c AND COALESCE(e.category,'event')='event'
+              ORDER BY tkey DESC
+            """), {"c": club_id}).mappings().all()
+
+        owner = is_admin_or_owner(club_id, user["id"])
+        return render_template(
+            "club_dashboard.html",
+            user=user, club=club, members=members,
+            meetings=meetings, events=events,
+            owner=owner
+        )
+
+    # ===================== ANALİZ SAYFALARI =====================
+    # (Var olan analytics endpointlerini yeniden kullanıyoruz)
+
+    @app.get("/clubs/<int:club_id>/analysis")
+    def club_analysis(club_id):
+        # yetki kontrolü: üye olmayan görmesin
+        user = current_user()
+        if not user: return redirect(url_for("home"))
+        with engine.begin() as con:
+            mem = con.execute(
+                text("SELECT 1 FROM club_members WHERE club_id=:c AND user_id=:u"),
+                {"c": club_id, "u": user["id"]}
+            ).first()
+            if not mem:
+                flash("Bu kulüp için erişimin yok.", "danger")
+                return redirect(url_for("my_panels"))
+        # aşağıdaki route mevcut detay analitik sayfasını render ediyordu
+        return redirect(url_for("club_analytics", club_id=club_id))
+
+    # Mevcut club analytics (detaylı)
+    @app.get("/clubs/<int:club_id>/analytics")
+    def club_analytics(club_id):
+        user = current_user()
+        if not user: return redirect(url_for("home"))
+        if not is_admin_or_owner(club_id, user["id"]):
+            flash("Kulüp analitiğine erişimin yok.", "danger")
+            return redirect(url_for("club_dashboard", club_id=club_id))
+
+        with engine.begin() as con:
+            club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": club_id}).mappings().first()
+
+            events = con.execute(text("""
+              SELECT e.id, e.title, e.category, e.starts_at, e.created_at,
+                     COALESCE(e.starts_at, e.created_at) AS tkey,
+                     (SELECT COUNT(*) FROM checkins ci WHERE ci.event_id=e.id) AS checkin_count
+              FROM events e 
+              WHERE e.club_id=:c 
+              ORDER BY COALESCE(e.starts_at, e.created_at) ASC, e.id ASC
+            """), {"c": club_id}).mappings().all()
+
+            member_count = con.execute(text("SELECT COUNT(*) FROM club_members WHERE club_id=:c"),
+                                       {"c": club_id}).scalar() or 0
+
+            event_ids = [e["id"] for e in events]
+            attendees_by_event = {eid: set() for eid in event_ids}
+            if event_ids:
+                placeholders = ",".join([str(eid) for eid in event_ids])
+                q = text(f"SELECT event_id, user_id FROM checkins WHERE event_id IN ({placeholders})")
+                allcis = con.execute(q).all()
+                for ev_id, uid in allcis:
+                    attendees_by_event[ev_id].add(uid)
+
+            retention_pairs = []
+            for i in range(len(events)-1):
+                a = attendees_by_event.get(events[i]["id"], set())
+                b = attendees_by_event.get(events[i+1]["id"], set())
+                rate = (len(a & b) / len(a) * 100.0) if a else 0.0
+                retention_pairs.append({
+                    "from_event_id": events[i]["id"],
+                    "to_event_id": events[i+1]["id"],
+                    "from_title": events[i]["title"],
+                    "to_title": events[i+1]["title"],
+                    "rate": rate,
+                    "from_count": len(a),
+                    "both_count": len(a & b)
+                })
+            avg_retention = (sum(p["rate"] for p in retention_pairs) / len(retention_pairs)) if retention_pairs else 0.0
+
+            active_user_ids = set()
+            for s in attendees_by_event.values(): active_user_ids |= s
+            users_meta = {}
+            if active_user_ids:
+                placeholders = ",".join([str(uid) for uid in active_user_ids])
+                uq = text(f"SELECT id, name, avatar_url FROM users WHERE id IN ({placeholders})")
+                for r in con.execute(uq).all():
+                    users_meta[r[0]] = {"id": r[0], "name": r[1], "avatar_url": r[2]}
+
+            top_participants = []
+            active_counts = []
+            for uid in active_user_ids:
+                cnt = sum(1 for ev_id in event_ids if uid in attendees_by_event.get(ev_id, set()))
+                active_counts.append((uid, cnt))
+            active_counts.sort(key=lambda x: x[1], reverse=True)
+            for uid, cnt in active_counts[:5]:
+                meta = users_meta.get(uid, {"name": f"User {uid}"})
+                top_participants.append({"user_id": uid, "name": meta.get("name"), "avatar_url": meta.get("avatar_url"), "count": cnt})
+
+            degrees = {}
+            edges = con.execute(text("""
+                SELECT src_user_id, dst_user_id FROM graph_edges 
+                WHERE club_id=:c AND status='accepted'
+            """), {"c": club_id}).all()
+            for s, d in edges:
+                degrees[s] = degrees.get(s, 0) + 1
+                degrees[d] = degrees.get(d, 0) + 1
+            degree_sorted = sorted(degrees.items(), key=lambda x: x[1], reverse=True)
+            top_connectors = []
+            for uid, deg in degree_sorted[:5]:
+                meta = users_meta.get(uid)
+                if not meta:
+                    m = con.execute(text("SELECT name, avatar_url FROM users WHERE id=:i"), {"i": uid}).first()
+                    meta = {"name": m[0] if m else f"User {uid}", "avatar_url": m[1] if m else None}
+                top_connectors.append({"user_id": uid, "name": meta["name"], "avatar_url": meta["avatar_url"], "degree": deg})
+
+        trend = [{"event_id": e["id"], "title": e["title"], "category": (e["category"] or "event"),
+                  "t": e["tkey"], "count": e["checkin_count"]} for e in events]
+
+        total_events = len(events)
+        total_checkins = sum(e["checkin_count"] for e in events)
+        unique_attendees = len({uid for s in attendees_by_event.values() for uid in s})
+        repeaters = sum(1 for _, c in active_counts if c >= 2)
+
+        return render_template("club_analysis.html",
+                               user=user, club=club, events=events,
+                               member_count=member_count, trend=trend,
+                               total_events=total_events,
+                               total_checkins=total_checkins,
+                               unique_attendees=unique_attendees,
+                               repeaters=repeaters,
+                               avg_retention=avg_retention,
+                               top_participants=top_participants,
+                               top_connectors=top_connectors)
+
+    # Var olan event analytics (butonlardan buraya yönlendir)
+    @app.get("/events/<int:event_id>/analysis")
+    def event_analytics(event_id):
+        user = current_user()
+        if not user: return redirect(url_for("home"))
+
+        with engine.begin() as con:
+            ev = con.execute(text("SELECT * FROM events WHERE id=:id"), {"id": event_id}).mappings().first()
+            if not ev: abort(404)
+            club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": ev["club_id"]}).mappings().first()
+            if not club: abort(404)
+            if not is_admin_or_owner(ev["club_id"], user["id"]):
+                flash("Bu etkinliğin analitiğine erişimin yok.", "danger")
+                return redirect(url_for("club_dashboard", club_id=ev["club_id"]))
+
+            attendees = con.execute(text("""
+              SELECT u.id, u.name, u.avatar_url, u.edu_email, ci.checked_at
+              FROM checkins ci JOIN users u ON u.id=ci.user_id
+              WHERE ci.event_id=:e
+              ORDER BY u.name
+            """), {"e": event_id}).mappings().all()
+
+            member_count = con.execute(text("""
+              SELECT COUNT(*) FROM club_members WHERE club_id=:c
+            """), {"c": ev["club_id"]}).scalar() or 0
+
+            events_all = con.execute(text("""
+              SELECT id, title, COALESCE(starts_at, created_at) AS tkey, created_at
+              FROM events WHERE club_id=:c ORDER BY COALESCE(starts_at, created_at) ASC, id ASC
+            """), {"c": ev["club_id"]}).mappings().all()
+
+            cur_key = ev["starts_at"] if ev["starts_at"] else ev["created_at"]
+            next_id = None
+            for e in events_all:
+                if e["id"] == ev["id"]:
+                    continue
+                if e["tkey"] and cur_key and e["tkey"] > cur_key:
+                    next_id = e["id"]; break
+            if not next_id and len(events_all) >= 2:
+                ids = [x["id"] for x in events_all]
+                try:
+                    idx = ids.index(ev["id"])
+                    if idx < len(ids) - 1:
+                        next_id = ids[idx+1]
+                except ValueError:
+                    pass
+
+            total_att = len(attendees)
+            edu_verified = sum(1 for a in attendees if a.get("edu_email"))
+
+            continued = 0
+            if next_id and total_att > 0:
+                ids = [str(a["id"]) for a in attendees]
+                placeholders = ",".join(ids) if ids else "0"
+                q = text(f"SELECT COUNT(*) FROM checkins WHERE event_id=:ne AND user_id IN ({placeholders})")
+                continued = con.execute(q, {"ne": next_id}).scalar() or 0
+
+            new_edges_after = con.execute(text("""
+              SELECT COUNT(*) FROM graph_edges 
+              WHERE club_id=:c AND status='accepted' AND created_at >= :t0
+            """), {"c": ev["club_id"], "t0": ev["created_at"]}).scalar() or 0
+
+        att_rate = (total_att / member_count * 100.0) if member_count else 0.0
+        cont_rate = (continued / total_att * 100.0) if total_att else 0.0
+
+        # Şablon: event_analytics.html (zaten vardı)
+        return render_template("event_analytics.html",
+                               user=user, club=club, event=ev,
+                               attendees=attendees,
+                               member_count=member_count,
+                               total_att=total_att,
+                               att_rate=att_rate,
+                               edu_verified=edu_verified,
+                               new_edges_after=new_edges_after,
+                               continued=continued,
+                               cont_rate=cont_rate)
+
+    # ===================== VAR OLAN (giriş/verify vs.) =====================
+
     @app.get("/health")
     def health():
         return {"ok": True}
 
-    @app.get("/")
-    def index():
-        user = current_user()
-        return render_template("index.html", user=user)
-
-    @app.get("/dashboard")
-    def dashboard():
-        user = current_user()
-        if not user:
-            return redirect(url_for("index"))
-        with engine.begin() as con:
-            clubs = con.execute(text("""
-              SELECT c.*, 
-                     (SELECT COUNT(*) FROM club_members m WHERE m.club_id=c.id) AS member_count,
-                     (SELECT COUNT(*) FROM events e WHERE e.club_id=c.id) AS event_count
-              FROM clubs c
-              JOIN club_members m ON m.club_id=c.id AND m.user_id=:u
-              ORDER BY c.created_at DESC
-            """), {"u": user["id"]}).mappings().all()
-        return render_template("dashboard.html", user=user, clubs=clubs)
-
     @app.get("/logout")
     def logout():
         session.clear()
-        return redirect(url_for("index"))
+        return redirect(url_for("home"))
 
     # ---------- LinkedIn OAuth2 ----------
     @app.get("/auth/linkedin/login")
@@ -378,17 +705,17 @@ def create_app():
     def li_callback():
         if request.args.get("error"):
             flash(f"LinkedIn yetkilendirme hatası: {request.args.get('error_description','error')}", "danger")
-            return redirect(url_for("index"))
+            return redirect(url_for("home"))
 
         state = request.args.get("state")
         if not state or state != session.get("oauth_state"):
             flash("CSRF uyarısı: state uyuşmuyor.", "danger")
-            return redirect(url_for("index"))
+            return redirect(url_for("home"))
 
         code = request.args.get("code")
         if not code:
             flash("Yetkilendirme kodu alınamadı.", "danger")
-            return redirect(url_for("index"))
+            return redirect(url_for("home"))
 
         token_url = "https://www.linkedin.com/oauth/v2/accessToken"
         redirect_uri = app.config["HOST_URL"].rstrip("/") + url_for("li_callback")
@@ -409,17 +736,17 @@ def create_app():
                 print("[DEBUG] accessToken status:", resp.status_code, "| body:", resp.text[:500])
             if resp.status_code != 200:
                 flash("LinkedIn access token alınamadı.", "danger")
-                return redirect(url_for("index"))
+                return redirect(url_for("home"))
             tok = resp.json()
             access_token = tok.get("access_token")
             if not access_token:
                 flash("Access token bulunamadı.", "danger")
-                return redirect(url_for("index"))
+                return redirect(url_for("home"))
         except Exception:
             print("[ERROR] Token exchange failed:")
             traceback.print_exc()
             flash("Token değişiminde hata oluştu.", "danger")
-            return redirect(url_for("index"))
+            return redirect(url_for("home"))
 
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -479,7 +806,7 @@ def create_app():
 
         if not sub:
             flash("LinkedIn kullanıcı bilgisi alınamadı. Lütfen tekrar deneyin.", "danger")
-            return redirect(url_for("index"))
+            return redirect(url_for("home"))
 
         # kullanıcı upsert
         with engine.begin() as con:
@@ -492,7 +819,6 @@ def create_app():
                 if is_postgres(engine):
                     uid = insert_with_returning(
                         con, engine,
-                        # sqlite eşleniği (RETURNING yok, lastrowid alacağız ama burada zaten pg branch’indeyiz)
                         sql_sqlite="",
                         sql_pg="""
                           INSERT INTO users (linkedin_id, name, avatar_url, edu_email)
@@ -518,13 +844,13 @@ def create_app():
         nxt = session.get("next_url")
         if email and allowed_edu(email):
             return redirect(url_for("verify", next=nxt) if nxt else url_for("verify"))
-        return redirect(nxt or url_for("dashboard"))
+        return redirect(nxt or url_for("home"))
 
     # ---------- EDU doğrulama ----------
     @app.get("/verify")
     def verify():
         user = current_user()
-        if not user: return redirect(url_for("index"))
+        if not user: return redirect(url_for("home"))
         nxt = request.args.get("next")
         if nxt: session["next_url"] = nxt
         return render_template("verify.html", user=user,
@@ -533,7 +859,7 @@ def create_app():
     @app.post("/verify/start")
     def verify_start():
         user = current_user()
-        if not user: return redirect(url_for("index"))
+        if not user: return redirect(url_for("home"))
         edu_email = (request.form.get("edu_email") or "").strip()
         if not edu_email:
             flash("E-posta gerekli.", "danger")
@@ -577,94 +903,17 @@ def create_app():
         flash("EDU e-posta doğrulandı.", "success")
         session["uid"] = uid
         nxt = session.pop("next_url", None)
-        return redirect(nxt or url_for("dashboard"))
+        return redirect(nxt or url_for("home"))
 
-    # ---------- Kulüp işlemleri ----------
-    @app.get("/clubs/new")
-    def club_new():
-        user = current_user()
-        if not user: return redirect(url_for("li_login", next=request.url))
-        return render_template("club_new.html", user=user)
+    # ===================== EVENT OLUŞTURMA/QR (VAR OLANLAR) =====================
 
-    @app.post("/clubs/new")
-    def club_new_post():
-        user = current_user()
-        if not user: return redirect(url_for("li_login", next=request.url))
-        name = (request.form.get("name") or "").strip()
-        if not name:
-            flash("Kulüp adı zorunlu.", "danger")
-            return redirect(url_for("club_new"))
-        s = slugify(name)
-        with engine.begin() as con:
-            if is_postgres(engine):
-                club_id = insert_with_returning(
-                    con, engine,
-                    sql_sqlite="",
-                    sql_pg="""
-                      INSERT INTO clubs (name, slug, owner_user_id, created_at)
-                      VALUES (:n,:s,:o,:t)
-                      RETURNING id
-                    """,
-                    params={"n": name, "s": s, "o": user["id"], "t": now_ts()}
-                )
-            else:
-                club_id = insert_with_returning(
-                    con, engine,
-                    sql_sqlite="""
-                      INSERT INTO clubs (name, slug, owner_user_id, created_at)
-                      VALUES (:n,:s,:o,:t)
-                    """,
-                    sql_pg="",
-                    params={"n": name, "s": s, "o": user["id"], "t": now_ts()}
-                )
-            # owner kaydı
-            insert_ignore_or_conflict(
-                con, engine,
-                table="club_members",
-                columns=["club_id","user_id","role","joined_at"],
-                values_map={"club_id": club_id, "user_id": user["id"], "role": "owner", "joined_at": now_ts()},
-                conflict_cols=["club_id","user_id"],
-                update_map={"role": "owner", "joined_at": now_ts()}
-            )
-        flash("Kulüp oluşturuldu.", "success")
-        return redirect(url_for("club_detail", club_id=club_id))
-
-    @app.get("/clubs/<int:club_id>")
-    def club_detail(club_id):
-        user = current_user()
-        if not user: return redirect(url_for("li_login", next=request.url))
-        with engine.begin() as con:
-            club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": club_id}).mappings().first()
-            if not club: abort(404)
-            ensure_member(club_id, user["id"])
-            events = con.execute(text("""
-               SELECT e.*, 
-                      (SELECT COUNT(*) FROM checkins ci WHERE ci.event_id=e.id) AS checkin_count
-               FROM events e WHERE e.club_id=:c ORDER BY e.created_at DESC
-            """), {"c": club_id}).mappings().all()
-            members = con.execute(text("""
-               SELECT u.id, u.name, u.avatar_url, m.role
-               FROM club_members m JOIN users u ON u.id=m.user_id
-               WHERE m.club_id=:c ORDER BY u.name
-            """), {"c": club_id}).mappings().all()
-            incoming = con.execute(text("""
-               SELECT ge.*, u.name, u.avatar_url
-               FROM graph_edges ge 
-               JOIN users u ON u.id=ge.src_user_id
-               WHERE ge.club_id=:c AND ge.dst_user_id=:me AND ge.status='pending'
-            """), {"c": club_id, "me": user["id"]}).mappings().all()
-        owner = is_admin_or_owner(club_id, user["id"])
-        return render_template("club_dashboard.html", user=user, club=club, events=events, members=members,
-                               incoming=incoming, owner=owner)
-
-    # ---------- Etkinlik oluştur + QR ----------
     @app.get("/clubs/<int:club_id>/events/new")
     def event_new(club_id):
         user = current_user()
         if not user: return redirect(url_for("li_login", next=request.url))
         if not is_admin_or_owner(club_id, user["id"]):
             flash("Bu kulüpte etkinlik oluşturma yetkin yok.", "danger")
-            return redirect(url_for("club_detail", club_id=club_id))
+            return redirect(url_for("club_dashboard", club_id=club_id))
         return render_template("event_create.html", user=user, club_id=club_id)
 
     @app.post("/clubs/<int:club_id>/events/new")
@@ -673,8 +922,9 @@ def create_app():
         if not user: return redirect(url_for("li_login", next=request.url))
         if not is_admin_or_owner(club_id, user["id"]):
             flash("Bu kulüpte etkinlik oluşturma yetkin yok.", "danger")
-            return redirect(url_for("club_detail", club_id=club_id))
+            return redirect(url_for("club_dashboard", club_id=club_id))
         title = (request.form.get("title") or "").strip()
+        category = (request.form.get("category") or "event").strip()  # "event" | "meeting"
         starts = (request.form.get("starts_at") or "").strip()
         ends   = (request.form.get("ends_at") or "").strip()
         if not title:
@@ -696,21 +946,21 @@ def create_app():
                     con, engine,
                     sql_sqlite="",
                     sql_pg="""
-                      INSERT INTO events (club_id, title, starts_at, ends_at, qr_secret, created_by, created_at)
-                      VALUES (:c,:t,:s,:e,:q,:u,:now)
+                      INSERT INTO events (club_id, title, category, starts_at, ends_at, qr_secret, created_by, created_at)
+                      VALUES (:c,:t,:cat,:s,:e,:q,:u,:now)
                       RETURNING id
                     """,
-                    params={"c": club_id, "t": title, "s": starts_at, "e": ends_at, "q": qr_secret, "u": user["id"], "now": now_ts()}
+                    params={"c": club_id, "t": title, "cat": category, "s": starts_at, "e": ends_at, "q": qr_secret, "u": user["id"], "now": now_ts()}
                 )
             else:
                 event_id = insert_with_returning(
                     con, engine,
                     sql_sqlite="""
-                      INSERT INTO events (club_id, title, starts_at, ends_at, qr_secret, created_by, created_at)
-                      VALUES (:c,:t,:s,:e,:q,:u,:now)
+                      INSERT INTO events (club_id, title, category, starts_at, ends_at, qr_secret, created_by, created_at)
+                      VALUES (:c,:t,:cat,:s,:e,:q,:u,:now)
                     """,
                     sql_pg="",
-                    params={"c": club_id, "t": title, "s": starts_at, "e": ends_at, "q": qr_secret, "u": user["id"], "now": now_ts()}
+                    params={"c": club_id, "t": title, "cat": category, "s": starts_at, "e": ends_at, "q": qr_secret, "u": user["id"], "now": now_ts()}
                 )
         flash("Etkinlik oluşturuldu.", "success")
         return redirect(url_for("event_live", event_id=event_id))
@@ -726,7 +976,7 @@ def create_app():
             if not club: abort(404)
             if not is_admin_or_owner(ev["club_id"], user["id"]):
                 flash("Bu etkinliğin canlı ekranına erişimin yok.", "danger")
-                return redirect(url_for("club_detail", club_id=ev["club_id"]))
+                return redirect(url_for("club_dashboard", club_id=ev["club_id"]))
             cnt = con.execute(text("SELECT COUNT(*) FROM checkins WHERE event_id=:e"), {"e": event_id}).scalar() or 0
         join_url = app.config["HOST_URL"].rstrip("/") + url_for("join") + f"?e={event_id}&q={quote(ev['qr_secret'])}"
         return render_template("event_live_qr.html", user=user, event=ev, club=club, join_url=join_url, count=cnt)
@@ -743,14 +993,13 @@ def create_app():
         buf.seek(0)
         return send_file(buf, mimetype="image/png", max_age=0)
 
-    # ---------- QR ile check-in ----------
     @app.get("/join")
     def join():
         e = request.args.get("e", type=int)
         q = request.args.get("q", type=str)
         if not e or not q:
             flash("Etkinlik bilgisi eksik.", "danger")
-            return redirect(url_for("index"))
+            return redirect(url_for("home"))
         user = current_user()
         if not user:
             session["next_url"] = request.url
@@ -759,10 +1008,10 @@ def create_app():
             ev = con.execute(text("SELECT * FROM events WHERE id=:id"), {"id": e}).mappings().first()
             if not ev:
                 flash("Etkinlik bulunamadı.", "danger")
-                return redirect(url_for("index"))
+                return redirect(url_for("home"))
             if ev["qr_secret"] != q:
                 flash("Geçersiz QR.", "danger")
-                return redirect(url_for("index"))
+                return redirect(url_for("home"))
             ensure_member(ev["club_id"], user["id"])
             insert_ignore_or_conflict(
                 con, engine,
@@ -770,19 +1019,19 @@ def create_app():
                 columns=["event_id","user_id","checked_at","via_qr_secret"],
                 values_map={"event_id": e, "user_id": user["id"], "checked_at": now_ts(), "via_qr_secret": q},
                 conflict_cols=["event_id","user_id"],
-                update_map=None  # DO NOTHING/IGNORE
+                update_map=None
             )
         flash("Yoklamaya eklendin. Hoş geldin! 👋", "success")
-        return redirect(url_for("club_detail", club_id=ev["club_id"]))
+        return redirect(url_for("club_dashboard", club_id=ev["club_id"]))
 
-    # ---------- Ağ: tanıyorum / kabul ----------
+    # ---------- Ağ: bağlantılar ----------
     @app.post("/clubs/<int:club_id>/connect/<int:target_id>")
     def connect_send(club_id, target_id):
         user = current_user()
-        if not user: return redirect(url_for("li_login", next=request.referrer or url_for("club_detail", club_id=club_id)))
+        if not user: return redirect(url_for("li_login", next=request.referrer or url_for("club_dashboard", club_id=club_id)))
         if user["id"] == target_id:
             flash("Kendine bağ isteği gönderemezsin.", "warning")
-            return redirect(url_for("club_detail", club_id=club_id))
+            return redirect(url_for("club_dashboard", club_id=club_id))
         ensure_member(club_id, user["id"])
         ensure_member(club_id, target_id)
         with engine.begin() as con:
@@ -806,41 +1055,25 @@ def create_app():
                       VALUES (:c,:a,:b,'pending',:t)
                     """), {"c": club_id, "a": user["id"], "b": target_id, "t": now_ts()})
                 flash("Bağ isteği gönderildi.", "success")
-        return redirect(url_for("club_detail", club_id=club_id))
+        return redirect(url_for("club_dashboard", club_id=club_id))
 
     @app.post("/clubs/<int:club_id>/connect/accept")
     def connect_accept(club_id):
         user = current_user()
-        if not user: return redirect(url_for("li_login", next=request.referrer or url_for("club_detail", club_id=club_id)))
+        if not user: return redirect(url_for("li_login", next=request.referrer or url_for("club_dashboard", club_id=club_id)))
         src_id = request.form.get("from_id", type=int)
         if not src_id:
             flash("Geçersiz istek.", "danger")
-            return redirect(url_for("club_detail", club_id=club_id))
+            return redirect(url_for("club_dashboard", club_id=club_id))
         with engine.begin() as con:
             con.execute(text("""
               UPDATE graph_edges SET status='accepted'
               WHERE club_id=:c AND src_user_id=:s AND dst_user_id=:me AND status='pending'
             """), {"c": club_id, "s": src_id, "me": user["id"]})
         flash("Bağ kabul edildi.", "success")
-        return redirect(url_for("club_detail", club_id=club_id))
+        return redirect(url_for("club_dashboard", club_id=club_id))
 
-    # ---------- Ağ: görselleştirme sayfası ----------
-    @app.get("/clubs/<int:club_id>/graph")
-    def community_graph(club_id):
-        user = current_user()
-        if not user:
-            return redirect(url_for("li_login", next=request.url))
-        with engine.begin() as con:
-            mem = con.execute(
-                text("SELECT 1 FROM club_members WHERE club_id=:c AND user_id=:u"),
-                {"c": club_id, "u": user["id"]}
-            ).first()
-            if not mem:
-                flash("Bu kulübün ağına erişimin yok.", "danger")
-                return redirect(url_for("dashboard"))
-        return render_template("community_graph.html", user=user, club_id=club_id)
-
-    # ---------- Ağ: görselleştirme JSON ----------
+    # ---------- JSON graph ----------
     @app.get("/clubs/<int:club_id>/graph.json")
     def club_graph_json(club_id):
         user = current_user()
@@ -866,245 +1099,6 @@ def create_app():
         if DEBUG_TRACE:
             print(f"[DEBUG] graph json club={club_id} nodes={len(nodes)} edges={len(edges)}")
         return {"nodes": nodes, "edges": edges}
-
-    # ===================== ANALİTİKLER =====================
-
-    # ---- Etkinlik detay analitiği ----
-    @app.get("/events/<int:event_id>/analytics")
-    def event_analytics(event_id):
-        user = current_user()
-        if not user: return redirect(url_for("li_login", next=request.url))
-
-        with engine.begin() as con:
-            ev = con.execute(text("SELECT * FROM events WHERE id=:id"), {"id": event_id}).mappings().first()
-            if not ev: abort(404)
-            club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": ev["club_id"]}).mappings().first()
-            if not club: abort(404)
-            if not is_admin_or_owner(ev["club_id"], user["id"]):
-                flash("Bu etkinliğin analitiğine erişimin yok.", "danger")
-                return redirect(url_for("club_detail", club_id=ev["club_id"]))
-
-            attendees = con.execute(text("""
-              SELECT u.id, u.name, u.avatar_url, u.edu_email, ci.checked_at
-              FROM checkins ci JOIN users u ON u.id=ci.user_id
-              WHERE ci.event_id=:e
-              ORDER BY u.name
-            """), {"e": event_id}).mappings().all()
-
-            member_count = con.execute(text("""
-              SELECT COUNT(*) FROM club_members WHERE club_id=:c
-            """), {"c": ev["club_id"]}).scalar() or 0
-
-            # Kulübün tüm etkinliklerini zaman sırasına koy
-            events_all = con.execute(text("""
-              SELECT id, title, COALESCE(starts_at, created_at) AS tkey, created_at
-              FROM events WHERE club_id=:c ORDER BY COALESCE(starts_at, created_at) ASC, id ASC
-            """), {"c": ev["club_id"]}).mappings().all()
-            # mevcut etkinliğin "sonraki"sini bul
-            cur_key = ev["starts_at"] if ev["starts_at"] else ev["created_at"]
-            next_id = None
-            for e in events_all:
-                if e["id"] == ev["id"]:
-                    continue
-                if e["tkey"] and cur_key and e["tkey"] > cur_key:
-                    next_id = e["id"]; break
-            if not next_id and len(events_all) >= 2:
-                ids = [x["id"] for x in events_all]
-                try:
-                    idx = ids.index(ev["id"])
-                    if idx < len(ids) - 1:
-                        next_id = ids[idx+1]
-                except ValueError:
-                    pass
-
-            total_att = len(attendees)
-            edu_verified = sum(1 for a in attendees if a.get("edu_email"))
-
-            continued = 0
-            if next_id and total_att > 0:
-                ids = [str(a["id"]) for a in attendees]
-                placeholders = ",".join(ids) if ids else "0"
-                q = text(f"SELECT COUNT(*) FROM checkins WHERE event_id=:ne AND user_id IN ({placeholders})")
-                continued = con.execute(q, {"ne": next_id}).scalar() or 0
-
-            # Etkinlikten sonra kurulan accepted bağlantı sayısı (yaklaşık)
-            new_edges_after = con.execute(text("""
-              SELECT COUNT(*) FROM graph_edges 
-              WHERE club_id=:c AND status='accepted' AND created_at >= :t0
-            """), {"c": ev["club_id"], "t0": ev["created_at"]}).scalar() or 0
-
-        att_rate = (total_att / member_count * 100.0) if member_count else 0.0
-        cont_rate = (continued / total_att * 100.0) if total_att else 0.0
-
-        return render_template("event_analytics.html",
-                               user=user, club=club, event=ev,
-                               attendees=attendees,
-                               member_count=member_count,
-                               total_att=total_att,
-                               att_rate=att_rate,
-                               edu_verified=edu_verified,
-                               new_edges_after=new_edges_after,
-                               continued=continued,
-                               cont_rate=cont_rate)
-
-    # ---- Etkinlik CSV export ----
-    @app.get("/events/<int:event_id>/export.csv")
-    def event_export_csv(event_id):
-        user = current_user()
-        if not user: return redirect(url_for("li_login", next=request.url))
-        with engine.begin() as con:
-            ev = con.execute(text("SELECT * FROM events WHERE id=:id"), {"id": event_id}).mappings().first()
-            if not ev: abort(404)
-            if not is_admin_or_owner(ev["club_id"], user["id"]):
-                flash("Bu etkinliğin verilerini indirme yetkin yok.", "danger")
-                return redirect(url_for("club_detail", club_id=ev["club_id"]))
-            rows = con.execute(text("""
-              SELECT u.name, u.edu_email, u.avatar_url, ci.checked_at
-              FROM checkins ci JOIN users u ON u.id=ci.user_id
-              WHERE ci.event_id=:e
-              ORDER BY u.name
-            """), {"e": event_id}).all()
-
-        def generate():
-            output = io.StringIO()
-            writer = csv.writer(output)
-            writer.writerow(["Name", "EDU Email", "Avatar URL", "Checked At (local)"])
-            yield output.getvalue(); output.seek(0); output.truncate(0)
-            for r in rows:
-                writer.writerow([r[0], r[1] or "", r[2] or "", ts2human(r[3])])
-                yield output.getvalue(); output.seek(0); output.truncate(0)
-
-        filename = f"event_{event_id}_checkins.csv"
-        return Response(generate(), mimetype="text/csv",
-                        headers={"Content-Disposition": f"attachment; filename={filename}"})
-
-    # ---- Kulüp genel analitik ----
-    @app.get("/clubs/<int:club_id>/analytics")
-    def club_analytics(club_id):
-        user = current_user()
-        if not user: return redirect(url_for("li_login", next=request.url))
-        if not is_admin_or_owner(club_id, user["id"]):
-            flash("Kulüp analitiğine erişimin yok.", "danger")
-            return redirect(url_for("club_detail", club_id=club_id))
-
-        with engine.begin() as con:
-            club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": club_id}).mappings().first()
-
-            events = con.execute(text("""
-              SELECT e.id, e.title, e.starts_at, e.created_at,
-                     COALESCE(e.starts_at, e.created_at) AS tkey,
-                     (SELECT COUNT(*) FROM checkins ci WHERE ci.event_id=e.id) AS checkin_count
-              FROM events e 
-              WHERE e.club_id=:c 
-              ORDER BY COALESCE(e.starts_at, e.created_at) ASC, e.id ASC
-            """), {"c": club_id}).mappings().all()
-
-            member_count = con.execute(text("SELECT COUNT(*) FROM club_members WHERE club_id=:c"),
-                                       {"c": club_id}).scalar() or 0
-
-            # Tüm check-in'leri çekip event->set(user_id) sözlüğü oluştur
-            event_ids = [e["id"] for e in events]
-            attendees_by_event = {eid: set() for eid in event_ids}
-            if event_ids:
-                placeholders = ",".join([str(eid) for eid in event_ids])
-                q = text(f"""
-                    SELECT event_id, user_id FROM checkins 
-                    WHERE event_id IN ({placeholders})
-                """)
-                allcis = con.execute(q).all()
-                for ev_id, uid in allcis:
-                    attendees_by_event[ev_id].add(uid)
-
-            # Retention: ardışık etkinlikler arasında
-            retention_pairs = []
-            for i in range(len(events)-1):
-                a = attendees_by_event.get(events[i]["id"], set())
-                b = attendees_by_event.get(events[i+1]["id"], set())
-                rate = (len(a & b) / len(a) * 100.0) if a else 0.0
-                retention_pairs.append({
-                    "from_event_id": events[i]["id"],
-                    "to_event_id": events[i+1]["id"],
-                    "from_title": events[i]["title"],
-                    "to_title": events[i+1]["title"],
-                    "rate": rate,
-                    "from_count": len(a),
-                    "both_count": len(a & b)
-                })
-            avg_retention = (sum(p["rate"] for p in retention_pairs) / len(retention_pairs)) if retention_pairs else 0.0
-
-            # Heatmap için satırlar = kullanıcılar (en az 1 kez katılan)
-            active_user_ids = set()
-            for s in attendees_by_event.values():
-                active_user_ids |= s
-            users_meta = {}
-            if active_user_ids:
-                placeholders = ",".join([str(uid) for uid in active_user_ids])
-                uq = text(f"SELECT id, name, avatar_url FROM users WHERE id IN ({placeholders})")
-                for r in con.execute(uq).all():
-                    users_meta[r[0]] = {"id": r[0], "name": r[1], "avatar_url": r[2]}
-            heatmap_rows = []
-            for uid in sorted(list(active_user_ids)):
-                row = {
-                    "user_id": uid,
-                    "name": users_meta.get(uid, {}).get("name", f"User {uid}"),
-                    "avatar_url": users_meta.get(uid, {}).get("avatar_url"),
-                    "attends": []
-                }
-                for e in events:
-                    row["attends"].append(1 if uid in attendees_by_event.get(e["id"], set()) else 0)
-                heatmap_rows.append(row)
-
-            # En aktif katılımcılar
-            active_counts = []
-            for uid in active_user_ids:
-                cnt = sum(1 for ev_id in event_ids if uid in attendees_by_event.get(ev_id, set()))
-                active_counts.append((uid, cnt))
-            active_counts.sort(key=lambda x: x[1], reverse=True)
-            top_participants = []
-            for uid, cnt in active_counts[:5]:
-                meta = users_meta.get(uid, {"name": f"User {uid}"})
-                top_participants.append({"user_id": uid, "name": meta.get("name"), "avatar_url": meta.get("avatar_url"), "count": cnt})
-
-            # En çok bağlantı (degree)
-            degrees = {}
-            edges = con.execute(text("""
-                SELECT src_user_id, dst_user_id FROM graph_edges 
-                WHERE club_id=:c AND status='accepted'
-            """), {"c": club_id}).all()
-            for s, d in edges:
-                degrees[s] = degrees.get(s, 0) + 1
-                degrees[d] = degrees.get(d, 0) + 1
-            degree_sorted = sorted(degrees.items(), key=lambda x: x[1], reverse=True)
-            top_connectors = []
-            for uid, deg in degree_sorted[:5]:
-                meta = users_meta.get(uid)
-                if not meta:
-                    m = con.execute(text("SELECT name, avatar_url FROM users WHERE id=:i"), {"i": uid}).first()
-                    meta = {"name": m[0] if m else f"User {uid}", "avatar_url": m[1] if m else None}
-                top_connectors.append({"user_id": uid, "name": meta["name"], "avatar_url": meta["avatar_url"], "degree": deg})
-
-        # Trend verisi
-        trend = [{"event_id": e["id"], "title": e["title"], "t": e["tkey"], "count": e["checkin_count"]} for e in events]
-
-        # Özet metrikler
-        total_events = len(events)
-        total_checkins = sum(e["checkin_count"] for e in events)
-        unique_attendees = len(active_user_ids)
-        repeaters = sum(1 for _, c in active_counts if c >= 2)
-
-        return render_template("club_analytics.html",
-                               user=user, club=club, events=events,
-                               member_count=member_count,
-                               trend=trend,
-                               total_events=total_events,
-                               total_checkins=total_checkins,
-                               unique_attendees=unique_attendees,
-                               repeaters=repeaters,
-                               avg_retention=avg_retention,
-                               retention_pairs=retention_pairs,
-                               heatmap_rows=heatmap_rows,
-                               top_participants=top_participants,
-                               top_connectors=top_connectors)
 
     @app.context_processor
     def inject_globals():

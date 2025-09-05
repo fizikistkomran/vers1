@@ -1,12 +1,16 @@
 {% extends "base.html" %}
-{% block title %}EDU Doğrulama • enfekte.co{% endblock %}
+{% block title %}EDU Doğrulama · enfekte.co{% endblock %}
 {% block content %}
-  <h3>EDU e-posta doğrulaması</h3>
-  <p class="muted">İzinli alanlar: {{ allowed }}</p>
-  <form method="post" action="{{ url_for('verify_start') }}">
-    <label for="edu_email">EDU e-posta adresin</label>
-    <input type="email" id="edu_email" name="edu_email" placeholder="ad.soyad@itu.edu.tr" required />
-    <button type="submit">Doğrulama bağlantısı gönder</button>
-  </form>
+<h2 class="section-title">EDU e-posta doğrulaması</h2>
+<p class="sub">İzinli alanlar: {{ allowed }}</p>
+<form method="post" action="{{ url_for('verify_start') }}" class="list">
+  <div class="row" style="flex-wrap:wrap">
+    <label style="min-width:140px">EDU e-posta</label>
+    <input required type="email" name="edu_email" placeholder="ad.soyad@{{ (allowed.split(',')[0] if allowed) or 'edu.tr' }}" style="flex:1; padding:10px;border-radius:10px;border:1px solid var(--glass-stroke);background:rgba(255,255,255,.06);color:#fff">
+  </div>
+  <div class="row">
+    <button class="btn-badge" type="submit">Doğrulama linki gönder</button>
+  </div>
+</form>
 {% endblock %}
 

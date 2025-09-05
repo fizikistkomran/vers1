@@ -1,18 +1,28 @@
 {% extends "base.html" %}
-{% block title %}Etkinlik Oluştur • enfekte.co{% endblock %}
+{% block title %}Yeni Etkinlik · enfekte.co{% endblock %}
 {% block content %}
-  <h3>Etkinlik Oluştur</h3>
-  <form method="post" action="{{ url_for('event_new_post', club_id=club_id) }}">
-    <label for="title">Başlık</label>
-    <input id="title" name="title" required placeholder="Örn: Tanışma Toplantısı" />
-
-    <label for="starts_at">Başlangıç (opsiyonel)</label>
-    <input type="datetime-local" id="starts_at" name="starts_at" />
-
-    <label for="ends_at">Bitiş (opsiyonel)</label>
-    <input type="datetime-local" id="ends_at" name="ends_at" />
-
-    <button type="submit">Oluştur</button>
-  </form>
+<h2 class="section-title">Yeni Etkinlik / Toplantı</h2>
+<form method="post" class="list">
+  <div class="row" style="flex-wrap:wrap">
+    <label style="min-width:140px">Başlık</label>
+    <input required name="title" placeholder="Etkinlik adı" style="flex:1; padding:10px;border-radius:10px;border:1px solid var(--glass-stroke);background:rgba(255,255,255,.06);color:#fff">
+  </div>
+  <div class="row" style="gap:20px;flex-wrap:wrap">
+    <label>Kategori</label>
+    <label class="kbd"><input type="radio" name="category" value="event" checked> etkinlik</label>
+    <label class="kbd"><input type="radio" name="category" value="meeting"> toplantı</label>
+  </div>
+  <div class="row" style="flex-wrap:wrap">
+    <label style="min-width:140px">Başlangıç</label>
+    <input type="datetime-local" name="starts_at" style="padding:10px;border-radius:10px;border:1px solid var(--glass-stroke);background:rgba(255,255,255,.06);color:#fff">
+  </div>
+  <div class="row" style="flex-wrap:wrap">
+    <label style="min-width:140px">Bitiş</label>
+    <input type="datetime-local" name="ends_at" style="padding:10px;border-radius:10px;border:1px solid var(--glass-stroke);background:rgba(255,255,255,.06);color:#fff">
+  </div>
+  <div class="row">
+    <button class="btn-badge" type="submit">Oluştur</button>
+  </div>
+</form>
 {% endblock %}
 

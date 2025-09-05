@@ -1,70 +1,55 @@
 {% extends "base.html" %}
-{% block title %}{{ club.name }} • Kulüp Paneli{% endblock %}
+{% block title %}{{ club.name }} · enfekte.co{% endblock %}
 {% block content %}
-  <h3>{{ club.name }}</h3>
-  <p class="muted">Kuruluş: {{ club.created_at|ts }}</p>
 
+<h2 class="section-title">{{ club.name }}</h2>
+
+<div class="toolbar" style="margin-bottom:16px">
+  <a href="{{ url_for('club_analysis', club_id=club.id) }}">Kulüp Analizi</a>
   {% if owner %}
-    <div class="btn-row">
-      <a role="button" href="{{ url_for('event_new', club_id=club.id) }}">+ Etkinlik Oluştur</a>
-      <a role="button" href="{{ url_for('community_graph', club_id=club.id) }}">Topluluk Ağı</a>
-    </div>
-  {% else %}
-    <div class="btn-row">
-      <a role="button" href="{{ url_for('community_graph', club_id=club.id) }}">Topluluk Ağı</a>
-    </div>
+    <a href="{{ url_for('event_new', club_id=club.id) }}">Yeni Etkinlik/Toplantı</a>
   {% endif %}
+</div>
 
-  <h4>Etkinlikler</h4>
-  {% if events %}
-    <div class="grid-2">
-      {% for e in events %}
-        <article>
-          <header><strong>{{ e.title }}</strong></header>
-          <p class="muted">
-            Başlangıç: {{ e.starts_at|ts }} • Bitiş: {{ e.ends_at|ts }} <br/>
-            Yoklama: <strong>{{ e.checkin_count }}</strong>
-          </p>
-          {% if owner %}
-            <footer>
-              <a role="button" href="{{ url_for('event_live', event_id=e.id) }}">Canlı QR Ekranı</a>
-            </footer>
-          {% endif %}
-        </article>
-      {% endfor %}
-    </div>
-  {% else %}
-    <p>Henüz etkinlik yok.</p>
-  {% endif %}
-
-  <h4>Üyeler</h4>
-  <div class="grid-3">
-    {% for m in members %}
-      <div class="chip">
-        {% if m.avatar_url %}<img class="avatar" src="{{ m.avatar_url }}"/>{% endif %}
-        <span>{{ m.name }}</span>
-        <span class="tag">{{ m.role }}</span>
-        {% if m.id != user.id %}
-          <form method="post" action="{{ url_for('connect_send', club_id=club.id, target_id=m.id) }}">
-            <button type="submit">Tanıyorum</button>
-          </form>
-        {% endif %}
-      </div>
+<h2 class="section-title">Toplantılar</h2>
+{% if meetings %}
+  <div class="grid">
+    {% for e in meetings %}
+      <a class="card" href="{{ url_for('event_analytics', event_id=e.id) }}">
+        <span class="chip">Toplantı</span>
+        <div style="font-size:20px">{{ e.title }}</div>
+        <div class="meta">{{ (e.starts_at or e.created_at)|ts }}</div>
+      </a>
     {% endfor %}
   </div>
+{% else %}
+  <div class="empty list">Toplantı yok.</div>
+{% endif %}
 
-  {% if incoming %}
-    <h4>Bekleyen Bağ İstekleri</h4>
-    {% for r in incoming %}
-      <div class="chip">
-        {% if r.avatar_url %}<img class="avatar" src="{{ r.avatar_url }}"/>{% endif %}
-        <span>{{ r.name }}</span>
-        <form method="post" action="{{ url_for('connect_accept', club_id=club.id) }}">
-          <input type="hidden" name="from_id" value="{{ r.src_user_id }}" />
-          <button type="submit">Kabul Et</button>
-        </form>
-      </div>
+<h2 class="section-title">Etkinlikler</h2>
+{% if events %}
+  <div class="grid">
+    {% for e in events %}
+      <a class="card" href="{{ url_for('event_analytics', event_id=e.id) }}">
+        <div style="font-size:20px">{{ e.title }}</div>
+        <div class="meta">{{ (e.starts_at or e.created_at)|ts }}</div>
+      </a>
     {% endfor %}
-  {% endif %}
+  </div>
+{% else %}
+  <div class="empty list">Etkinlik yok.</div>
+{% endif %}
+
+<h2 class="section-title">Üyeler</h2>
+<div class="list">
+  {% for m in members %}
+    <div class="row">
+      <span class="avatar"></span>
+      <div style="font-weight:700">{{ m.name or 'Üye' }}</div>
+      <span class="pill">{{ m.role }}</span>
+    </div>
+  {% endfor %}
+</div>
+
 {% endblock %}
 

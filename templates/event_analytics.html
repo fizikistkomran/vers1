@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}{{ event.title }} Analizi · enfekte.co{% endblock %}
+{% block content %}
+
+<h2 class="section-title">{{ event.title }} {% if (event.category or 'event') == 'meeting' %}<span class="pill">Toplantı</span>{% endif %}</h2>
+
+<div class="toolbar" style="margin-bottom:16px">
+  <a href="{{ url_for('club_dashboard', club_id=club.id) }}">Kulüp Paneli</a>
+  <a href="{{ url_for('club_analysis', club_id=club.id) }}">Kulüp Analizi</a>
+  <a href="{{ url_for('event_live', event_id=event.id) }}">Canlı Ekran</a>
+  <a href="{{ url_for('event_qr_png', event_id=event.id) }}">QR (PNG)</a>
+  <a href="{{ url_for('event_export_csv', event_id=event.id) }}">CSV İndir</a>
+</div>
+
+<div class="list" style="margin-bottom:16px">
+  <div class="row"><div>Etkinlik tarihi</div><div class="pill">{{ (event.starts_at or event.created_at)|ts }}</div></div>
+  <div class="row"><div>Toplam katılımcı</div><div class="pill">{{ total_att }}</div></div>
+  <div class="row"><div>Üye sayısı</div><div class="pill">{{ member_count }}</div></div>
+  <div class="row"><div>Katılım oranı</div><div class="pill">{{ '%.1f'|format(att_rate) }}%</div></div>
+  <div class="row"><div>EDU doğrulanmış</div><div class="pill">{{ edu_verified }}</div></div>
+  <div class="row"><div>Sonraki etkinliğe devam</div><div class="pill">{{ continued }}</div></div>
+  <div class="row"><div>Devam oranı</div><div class="pill">{{ '%.1f'|format(cont_rate) }}%</div></div>
+</div>
+
+<h2 class="section-title">Katılımcılar</h2>
+{% if attendees %}
+  <div class="list">
+    {% for a in attendees %}
+      <div class="row">
+        <span class="avatar"></span>
+        <div style="flex:1">
+          <div style="font-weight:700">{{ a.name or ('User ' ~ a.id) }}</div>
+          <div class="sub">{{ a.edu_email or 'edu yok' }}</div>
+        </div>
+        <div class="pill">{{ a.checked_at|ts }}</div>
+      </div>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="empty list">Henüz check-in yok.</div>
+{% endif %}
+
+{% endblock %}
+

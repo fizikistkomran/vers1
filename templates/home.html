@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Anasayfa · enfekte.co{% endblock %}
+{% block content %}
+
+<h2 class="section-title">Üyeliklerim</h2>
+{% if user and my_clubs %}
+  <div class="grid">
+    {% for c in my_clubs %}
+      <a class="card" href="{{ url_for('club_dashboard', club_id=c.id) }}">
+        <div class="club">{{ c.name }}</div>
+        <div class="meta sub">Kulüp paneline git</div>
+      </a>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="empty list">Üyeliğin yok. <a class="link" href="#">Kulüpleri keşfet</a></div>
+{% endif %}
+
+<h2 class="section-title">Kulüplerim / Etkinlik &amp; Toplantılar</h2>
+{% if user and my_events %}
+  <div class="grid">
+    {% for e in my_events %}
+      <a class="card" href="{{ url_for('event_analytics', event_id=e.id) }}">
+        <div class="club">{{ e.club_name }}</div>
+        {% if (e.category or 'event') == 'meeting' %}<span class="chip">Toplantı</span>{% endif %}
+        <div style="font-size:20px">{{ e.title }}</div>
+        <div class="meta">{{ (e.starts_at or e.created_at)|ts }}</div>
+      </a>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="empty list">Henüz kulüplerinin etkinliği görünmüyor.</div>
+{% endif %}
+
+<h2 class="section-title">Etkinlikler / Toplantılar</h2>
+{% if all_events %}
+  <div class="grid">
+    {% for e in all_events %}
+      <a class="card" href="{{ url_for('event_analytics', event_id=e.id) }}">
+        <div class="club">{{ e.club_name }}</div>
+        {% if (e.category or 'event') == 'meeting' %}<span class="chip">Toplantı</span>{% endif %}
+        <div style="font-size:20px">{{ e.title }}</div>
+        <div class="meta">{{ (e.starts_at or e.created_at)|ts }}</div>
+      </a>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="empty list">Sistemde etkinlik/toplantı yok.</div>
+{% endif %}
+
+{% endblock %}
+
