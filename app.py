@@ -795,7 +795,8 @@ def create_app():
     @app.get("/clubs/<int:club_id>/graph")
     def club_graph(club_id):
         user = current_user()
-        if not user: return redirect(url_for("home"))
+        if not user:
+            return redirect(url_for("home"))
         _, is_admin = user_membership(club_id, user["id"])
         if not is_admin:
             flash("Grafiği sadece admin-like profiller görebilir.", "warning")
@@ -805,64 +806,74 @@ def create_app():
             club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": club_id}).mappings().first()
             max_ts = con.execute(text("SELECT MAX(created_at) FROM graph_edges WHERE club_id=:c"), {"c": club_id}).scalar() or now_ts()
 
-        # Fallback: inline D3 sayfası
-        fallback = f"""
-        <h2>{club['name']} · Ağ Haritası (beta)</h2>
-        <div id="graph" style="width:100%;height:520px;border:1px solid #222;border-radius:12px"></div>
-        <div style="margin-top:8px">
-          <input id="timeRange" type="range" min="0" max="{int(max_ts)}" value="{int(max_ts)}" style="width:100%" />
-          <div style="display:flex;justify-content:space-between;font-size:12px;opacity:.7">
-            <span>başlangıç</span><span>şimdi</span>
+        # f-string KULLANMADAN Jinja ile render edilecek fallback HTML/JS
+        tmpl = """
+        <!doctype html>
+        <meta charset="utf-8">
+        <title>{{ club.name }} · Ağ Haritası</title>
+        <div style="padding:12px;font-family:system-ui;color:#eee;background:#111">
+          <h2 style="margin:8px 0 12px">{{ club.name }} · Ağ Haritası (beta)</h2>
+          <div id="graph" style="width:100%;height:520px;border:1px solid #222;border-radius:12px"></div>
+          <div style="margin-top:8px">
+            <input id="timeRange" type="range" min="0" max="{{ max_ts|int }}" value="{{ max_ts|int }}" style="width:100%" />
+            <div style="display:flex;justify-content:space-between;font-size:12px;opacity:.7">
+              <span>başlangıç</span><span>şimdi</span>
+            </div>
           </div>
         </div>
         <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
         <script>
-        const clubId = {club_id};
+        const clubId = {{ club_id }};
         const graphEl = document.getElementById('graph');
         const slider  = document.getElementById('timeRange');
 
         let svg, width, height, simulation, link, node, label;
+
         function init(){
-          width = graphEl.clientWidth; height = graphEl.clientHeight;
+          width = graphEl.clientWidth;
+          height = graphEl.clientHeight;
           svg = d3.select('#graph').append('svg')
             .attr('width', width).attr('height', height)
             .style('background','#111');
           link = svg.append('g').attr('stroke','#555').attr('stroke-opacity',0.6).selectAll('line');
           node = svg.append('g').attr('stroke','#fff').attr('stroke-width',1).selectAll('circle');
           label= svg.append('g').selectAll('text');
-          simulation = d3.forceSimulation().force('link', d3.forceLink().id(d=>d.id).distance(60))
-                                           .force('charge', d3.forceManyBody().strength(-180))
-                                           .force('center', d3.forceCenter(width/2, height/2));
+          simulation = d3.forceSimulation()
+            .force('link', d3.forceLink().id(d=>d.id).distance(60))
+            .force('charge', d3.forceManyBody().strength(-180))
+            .force('center', d3.forceCenter(width/2, height/2));
           fetchAndRender();
         }
 
         function fetchAndRender(){
           const until = slider.value;
-          fetch(`/clubs/${{clubId}}/graph.json?until=${{until}}`).then(r=>r.json()).then(data=>{
-            link = link.data(data.edges, d=>d.source+'-'+d.target);
-            link.exit().remove();
-            link = link.enter().append('line').merge(link);
+          fetch(`/clubs/${clubId}/graph.json?until=${until}`)
+            .then(r=>r.json())
+            .then(data=>{
+              link = link.data(data.edges, d=>d.source+'-'+d.target);
+              link.exit().remove();
+              link = link.enter().append('line').merge(link);
 
-            node = node.data(data.nodes, d=>d.id);
-            node.exit().remove();
-            node = node.enter().append('circle')
-              .attr('r', 10)
-              .attr('fill', '#2e8bfa')
-              .call(drag(simulation))
-              .merge(node);
+              node = node.data(data.nodes, d=>d.id);
+              node.exit().remove();
+              node = node.enter().append('circle')
+                .attr('r', 10)
+                .attr('fill', '#2e8bfa')
+                .call(drag(simulation))
+                .merge(node);
 
-            label = label.data(data.nodes, d=>d.id);
-            label.exit().remove();
-            label = label.enter().append('text')
-              .text(d=>d.label)
-              .attr('fill','#ddd')
-              .attr('font-size',11)
-              .merge(label);
+              label = label.data(data.nodes, d=>d.id);
+              label.exit().remove();
+              label = label.enter().append('text')
+                .text(d=>d.label)
+                .attr('fill','#ddd')
+                .attr('font-size',11)
+                .merge(label);
 
-            simulation.nodes(data.nodes).on('tick', ticked);
-            simulation.force('link').links(data.edges);
-            simulation.alpha(0.8).restart();
-          });
+              simulation.nodes(data.nodes).on('tick', ticked);
+              simulation.force('link').links(data.edges);
+              simulation.alpha(0.8).restart();
+            });
         }
 
         function ticked(){
@@ -885,13 +896,19 @@ def create_app():
           return d3.drag().on('start',dragstarted).on('drag',dragged).on('end',dragended);
         }
 
-        slider.addEventListener('input', fetchAndRender);
-        window.addEventListener('resize', ()=>{{ d3.select('#graph svg').remove(); init(); }});
+        // basit debounce
+        let t=null;
+        slider.addEventListener('input', ()=>{ clearTimeout(t); t=setTimeout(fetchAndRender,180); });
+        window.addEventListener('resize', ()=>{ d3.select('#graph svg').remove(); init(); });
         init();
         </script>
         """
-        return try_render("club_graph.html", user=user, club=club,
-                          page_title="Ağ Haritası", fallback_html=fallback)
+        # Eğer templates'te club_graph.html varsa onu kullanır; yoksa yukarıdaki fallback Jinja ile render edilir
+        try:
+            return render_template("club_graph.html", user=user, club=club, club_id=club_id, max_ts=int(max_ts))
+        except TemplateNotFound:
+            return render_template_string(tmpl, user=user, club=club, club_id=club_id, max_ts=int(max_ts))
+
 
     @app.get("/clubs/<int:club_id>/graph.json")
     def club_graph_json(club_id):
