@@ -1,16 +1,22 @@
-import os, smtplib, ssl, json, time, traceback, secrets, io, csv
+import os, io, csv, smtplib, ssl, json, time, traceback, secrets
 from email.message import EmailMessage
 from urllib.parse import urlencode, quote
 import requests
 import certifi
 import qrcode
+from PIL import Image
+from werkzeug.utils import secure_filename
 
-from flask import Flask, render_template, redirect, url_for, session, request, flash, send_file, abort, Response
+from flask import (
+    Flask, render_template, render_template_string, redirect, url_for, session,
+    request, flash, send_file, abort, Response
+)
 from dotenv import load_dotenv
-from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from itsdangerous import URLSafeTimedSerializer
 from sqlalchemy import create_engine, text
+from jinja2 import TemplateNotFound
 
-# --- .env'i yükle ---
+# --------- ENV / Config ---------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOTENV_PATH = os.path.join(BASE_DIR, ".env")
 load_dotenv(DOTENV_PATH)
@@ -18,6 +24,16 @@ load_dotenv(DOTENV_PATH)
 DEBUG_TRACE   = os.getenv("DEBUG_TRACE", "0") == "1"
 VERIFY_SSL    = os.getenv("VERIFY_SSL", "true").lower() == "true"
 REQUESTS_VERIFY = (certifi.where() if VERIFY_SSL else False)
+
+UPLOAD_ROOT = os.path.join(BASE_DIR, "static", "uploads")
+AVATAR_DIR  = os.path.join(UPLOAD_ROOT, "avatars")
+CLUB_DIR    = os.path.join(UPLOAD_ROOT, "clubs")
+EVENT_DIR   = os.path.join(UPLOAD_ROOT, "events")
+for p in (UPLOAD_ROOT, AVATAR_DIR, CLUB_DIR, EVENT_DIR):
+    os.makedirs(p, exist_ok=True)
+
+ALLOWED_IMG_EXT = {".jpg", ".jpeg", ".png", ".webp"}
+MAX_IMG_SIDE = 1600  # px
 
 def now_ts() -> float:
     return float(time.time())
@@ -29,14 +45,7 @@ def ts2human(ts):
     except Exception:
         return "-"
 
-def slugify(name: str) -> str:
-    s = "".join(ch.lower() if ch.isalnum() else "-" for ch in name.strip())
-    s = "-".join([p for p in s.split("-") if p])
-    s = s[:40]
-    return s + "-" + secrets.token_hex(2)
-
 # ----------------------- DB yardımcıları -----------------------
-
 def is_postgres(engine) -> bool:
     return engine.dialect.name in ("postgresql", "postgres")
 
@@ -44,6 +53,9 @@ def current_ts_sql(engine) -> str:
     return "EXTRACT(EPOCH FROM NOW())" if is_postgres(engine) else "strftime('%s','now')"
 
 def create_schema(engine):
+    """
+    Çekirdek tablolar + yeni banner/logo kolonları + görev/not tabloları.
+    """
     ts_default = current_ts_sql(engine)
 
     if is_postgres(engine):
@@ -54,20 +66,21 @@ def create_schema(engine):
               linkedin_id TEXT UNIQUE,
               name TEXT,
               avatar_url TEXT,
+              avatar_cached_at DOUBLE PRECISION,
               edu_email TEXT,
               edu_verified_at DOUBLE PRECISION,
               created_at DOUBLE PRECISION DEFAULT ({ts_default})
-            );
-            """,
+            );""",
             f"""
             CREATE TABLE IF NOT EXISTS clubs(
               id SERIAL PRIMARY KEY,
               name TEXT NOT NULL,
               slug TEXT UNIQUE,
               owner_user_id INTEGER NOT NULL,
+              banner_url TEXT,
+              logo_url TEXT,
               created_at DOUBLE PRECISION DEFAULT ({ts_default})
-            );
-            """,
+            );""",
             f"""
             CREATE TABLE IF NOT EXISTS club_members(
               club_id INTEGER NOT NULL,
@@ -75,20 +88,20 @@ def create_schema(engine):
               role TEXT NOT NULL DEFAULT 'member',
               joined_at DOUBLE PRECISION DEFAULT ({ts_default}),
               PRIMARY KEY (club_id, user_id)
-            );
-            """,
+            );""",
             f"""
             CREATE TABLE IF NOT EXISTS events(
               id SERIAL PRIMARY KEY,
               club_id INTEGER NOT NULL,
               title TEXT NOT NULL,
+              category TEXT DEFAULT 'event',
               starts_at DOUBLE PRECISION,
               ends_at DOUBLE PRECISION,
               qr_secret TEXT NOT NULL,
+              banner_url TEXT,
               created_by INTEGER NOT NULL,
               created_at DOUBLE PRECISION DEFAULT ({ts_default})
-            );
-            """,
+            );""",
             f"""
             CREATE TABLE IF NOT EXISTS checkins(
               event_id INTEGER NOT NULL,
@@ -96,19 +109,41 @@ def create_schema(engine):
               checked_at DOUBLE PRECISION DEFAULT ({ts_default}),
               via_qr_secret TEXT,
               PRIMARY KEY (event_id, user_id)
-            );
-            """,
+            );""",
             f"""
             CREATE TABLE IF NOT EXISTS graph_edges(
               id SERIAL PRIMARY KEY,
               club_id INTEGER NOT NULL,
               src_user_id INTEGER NOT NULL,
               dst_user_id INTEGER NOT NULL,
-              status TEXT NOT NULL DEFAULT 'pending',
+              status TEXT NOT NULL DEFAULT 'accepted',
               created_at DOUBLE PRECISION DEFAULT ({ts_default}),
               UNIQUE (club_id, src_user_id, dst_user_id)
-            );
-            """
+            );""",
+            # Görevler / Notlar (ileride kullanmak üzere hazır)
+            f"""
+            CREATE TABLE IF NOT EXISTS club_tasks(
+              id SERIAL PRIMARY KEY,
+              club_id INTEGER NOT NULL,
+              title TEXT NOT NULL,
+              description TEXT,
+              status TEXT NOT NULL DEFAULT 'todo',
+              due_at DOUBLE PRECISION,
+              assigned_user_id INTEGER,
+              created_by INTEGER NOT NULL,
+              created_at DOUBLE PRECISION DEFAULT ({ts_default}),
+              updated_at DOUBLE PRECISION
+            );""",
+            f"""
+            CREATE TABLE IF NOT EXISTS club_notes(
+              id SERIAL PRIMARY KEY,
+              club_id INTEGER NOT NULL,
+              title TEXT NOT NULL,
+              body TEXT,
+              created_by INTEGER NOT NULL,
+              created_at DOUBLE PRECISION DEFAULT ({ts_default}),
+              updated_at DOUBLE PRECISION
+            );"""
         ]
     else:
         ddl = [
@@ -118,20 +153,21 @@ def create_schema(engine):
               linkedin_id TEXT UNIQUE,
               name TEXT,
               avatar_url TEXT,
+              avatar_cached_at REAL,
               edu_email TEXT,
               edu_verified_at REAL,
               created_at REAL DEFAULT ({ts_default})
-            );
-            """,
+            );""",
             f"""
             CREATE TABLE IF NOT EXISTS clubs(
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               name TEXT NOT NULL,
               slug TEXT UNIQUE,
               owner_user_id INTEGER NOT NULL,
+              banner_url TEXT,
+              logo_url TEXT,
               created_at REAL DEFAULT ({ts_default})
-            );
-            """,
+            );""",
             f"""
             CREATE TABLE IF NOT EXISTS club_members(
               club_id INTEGER NOT NULL,
@@ -139,20 +175,20 @@ def create_schema(engine):
               role TEXT NOT NULL DEFAULT 'member',
               joined_at REAL DEFAULT ({ts_default}),
               PRIMARY KEY (club_id, user_id)
-            );
-            """,
+            );""",
             f"""
             CREATE TABLE IF NOT EXISTS events(
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               club_id INTEGER NOT NULL,
               title TEXT NOT NULL,
+              category TEXT DEFAULT 'event',
               starts_at REAL,
               ends_at REAL,
               qr_secret TEXT NOT NULL,
+              banner_url TEXT,
               created_by INTEGER NOT NULL,
               created_at REAL DEFAULT ({ts_default})
-            );
-            """,
+            );""",
             f"""
             CREATE TABLE IF NOT EXISTS checkins(
               event_id INTEGER NOT NULL,
@@ -160,45 +196,78 @@ def create_schema(engine):
               checked_at REAL DEFAULT ({ts_default}),
               via_qr_secret TEXT,
               PRIMARY KEY (event_id, user_id)
-            );
-            """,
+            );""",
             f"""
             CREATE TABLE IF NOT EXISTS graph_edges(
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               club_id INTEGER NOT NULL,
               src_user_id INTEGER NOT NULL,
               dst_user_id INTEGER NOT NULL,
-              status TEXT NOT NULL DEFAULT 'pending',
+              status TEXT NOT NULL DEFAULT 'accepted',
               created_at REAL DEFAULT ({ts_default}),
               UNIQUE (club_id, src_user_id, dst_user_id)
-            );
-            """
+            );""",
+            f"""
+            CREATE TABLE IF NOT EXISTS club_tasks(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              club_id INTEGER NOT NULL,
+              title TEXT NOT NULL,
+              description TEXT,
+              status TEXT NOT NULL DEFAULT 'todo',
+              due_at REAL,
+              assigned_user_id INTEGER,
+              created_by INTEGER NOT NULL,
+              created_at REAL DEFAULT ({ts_default}),
+              updated_at REAL
+            );""",
+            f"""
+            CREATE TABLE IF NOT EXISTS club_notes(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              club_id INTEGER NOT NULL,
+              title TEXT NOT NULL,
+              body TEXT,
+              created_by INTEGER NOT NULL,
+              created_at REAL DEFAULT ({ts_default}),
+              updated_at REAL
+            );"""
         ]
 
     with engine.begin() as con:
         for sql in ddl:
             con.exec_driver_sql(sql)
 
-def ensure_event_category_column(engine):
+def ensure_columns(engine):
+    """
+    Eski DB'lerde eksik kolonları güvenli şekilde ekler.
+    """
     try:
         with engine.begin() as con:
             if is_postgres(engine):
+                con.exec_driver_sql("ALTER TABLE users  ADD COLUMN IF NOT EXISTS avatar_cached_at DOUBLE PRECISION")
+                con.exec_driver_sql("ALTER TABLE users  ADD COLUMN IF NOT EXISTS edu_email TEXT")
+                con.exec_driver_sql("ALTER TABLE clubs  ADD COLUMN IF NOT EXISTS banner_url TEXT")
+                con.exec_driver_sql("ALTER TABLE clubs  ADD COLUMN IF NOT EXISTS logo_url TEXT")
+                con.exec_driver_sql("ALTER TABLE events ADD COLUMN IF NOT EXISTS banner_url TEXT")
                 con.exec_driver_sql("ALTER TABLE events ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'event'")
             else:
-                try:
-                    con.exec_driver_sql("ALTER TABLE events ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'event'")
-                except Exception:
-                    try:
-                        cols = con.execute(text("PRAGMA table_info(events)")).fetchall()
-                        names = [c[1] for c in cols]
-                        if "category" not in names:
-                            con.exec_driver_sql("ALTER TABLE events ADD COLUMN category TEXT DEFAULT 'event'")
-                    except Exception:
-                        pass
+                def has_col(table, col):
+                    rows = con.execute(text(f"PRAGMA table_info({table})")).fetchall()
+                    names = [r[1] for r in rows]
+                    return col in names
+                if not has_col("users", "avatar_cached_at"):
+                    con.exec_driver_sql("ALTER TABLE users ADD COLUMN avatar_cached_at REAL")
+                if not has_col("users", "edu_email"):
+                    con.exec_driver_sql("ALTER TABLE users ADD COLUMN edu_email TEXT")
+                if not has_col("clubs", "banner_url"):
+                    con.exec_driver_sql("ALTER TABLE clubs ADD COLUMN banner_url TEXT")
+                if not has_col("clubs", "logo_url"):
+                    con.exec_driver_sql("ALTER TABLE clubs ADD COLUMN logo_url TEXT")
+                if not has_col("events", "banner_url"):
+                    con.exec_driver_sql("ALTER TABLE events ADD COLUMN banner_url TEXT")
+                if not has_col("events", "category"):
+                    con.exec_driver_sql("ALTER TABLE events ADD COLUMN category TEXT DEFAULT 'event'")
     except Exception:
-        if DEBUG_TRACE:
-            print("[WARN] ensure_event_category_column failed")
-            traceback.print_exc()
+        if DEBUG_TRACE: traceback.print_exc()
 
 def insert_with_returning(con, engine, sql_sqlite, sql_pg, params):
     if is_postgres(engine):
@@ -226,33 +295,78 @@ def insert_ignore_or_conflict(con, engine, table, columns, values_map, conflict_
             sql = f"INSERT OR REPLACE INTO {table} ({cols}) VALUES ({placeholders})"
         con.execute(text(sql), values_map)
 
-# --------------------------------------------------------------
+# ----------------------- Görsel yardımcıları -----------------------
+def _is_img_filename(fname: str) -> bool:
+    ext = os.path.splitext(fname or "")[1].lower()
+    return ext in ALLOWED_IMG_EXT
 
+def _resize_and_save(image_bytes: bytes, out_path: str):
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    w, h = img.size
+    if max(w, h) > MAX_IMG_SIDE:
+        if w >= h:
+            new_w = MAX_IMG_SIDE
+            new_h = int(h * (MAX_IMG_SIDE / w))
+        else:
+            new_h = MAX_IMG_SIDE
+            new_w = int(w * (MAX_IMG_SIDE / h))
+        img = img.resize((new_w, new_h))
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    img.save(out_path, format="JPEG", quality=85, optimize=True)
+
+def _download_image_to_local(url: str, out_path: str) -> bool:
+    try:
+        r = requests.get(url, timeout=15, verify=REQUESTS_VERIFY)
+        if r.status_code != 200: return False
+        ctype = r.headers.get("Content-Type","").lower()
+        if not any(t in ctype for t in ["image/jpeg","image/jpg","image/png","image/webp","image/*"]):
+            return False
+        _resize_and_save(r.content, out_path)
+        return True
+    except Exception:
+        if DEBUG_TRACE: traceback.print_exc()
+        return False
+
+def _file_to_local(file_storage, out_dir: str, filename_base: str) -> str:
+    """Werkzeug FileStorage -> local jpg path; returns web URL under /static/uploads/..."""
+    if not file_storage or not getattr(file_storage, "filename", None):
+        return None
+    fname = secure_filename(file_storage.filename)
+    if not _is_img_filename(fname):
+        raise ValueError("Desteklenmeyen görsel türü.")
+    raw = file_storage.read()
+    if len(raw) > 10 * 1024 * 1024:
+        raise ValueError("Dosya çok büyük (10MB üstü).")
+    out_path = os.path.join(out_dir, f"{filename_base}.jpg")
+    _resize_and_save(raw, out_path)
+    # web path:
+    web_rel = out_path.split(os.path.join(BASE_DIR, "static"))[-1].replace("\\","/")
+    return "/static" + web_rel
+
+# --------------------------------------------------------------
 def create_app():
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret-key")
     app.config["HOST_URL"]   = os.getenv("HOST_URL", "http://localhost:8000")
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-    app.config["SESSION_COOKIE_SECURE"]   = False  # localhost
+    app.config["SESSION_COOKIE_SECURE"]   = False
+    app.config["MAX_CONTENT_LENGTH"]      = 12 * 1024 * 1024  # 12MB
 
     # --- DB ---
     DB_URL = os.getenv("DATABASE_URL", "sqlite:///enfekte.db")
     engine = create_engine(
-        DB_URL,
-        echo=False,
-        future=True,
-        pool_pre_ping=True,
-        pool_size=5,
-        max_overflow=5
+        DB_URL, echo=False, future=True, pool_pre_ping=True, pool_size=5, max_overflow=5
     )
-
     create_schema(engine)
-    ensure_event_category_column(engine)
+    ensure_columns(engine)
 
     serializer = URLSafeTimedSerializer(app.config["SECRET_KEY"])
 
     # ---------- Helpers ----------
-    ADMIN_LIKE_ROLES = {"owner","admin","officer","coordinator","manager","lead","moderator","editor"}
+    ADMIN_LIKE_ROLES = set([r.strip().lower() for r in os.getenv(
+        "ADMIN_LIKE_ROLES",
+        "owner,admin,officer,coordinator,manager,lead,moderator,editor"
+    ).split(",") if r.strip()]) or {"owner","admin"}
 
     def current_user():
         uid = session.get("uid")
@@ -284,12 +398,18 @@ def create_app():
 
     def is_admin_or_owner(club_id: int, user_id: int) -> bool:
         with engine.begin() as con:
-            row = con.execute(text("""
+            role_row = con.execute(text("""
               SELECT role FROM club_members WHERE club_id=:c AND user_id=:u
             """), {"c": club_id, "u": user_id}).first()
-            # admin-like roller veya member dışı roller
-            if row and (row[0] in ADMIN_LIKE_ROLES or row[0].lower() != "member"):
-                return True
+            if role_row:
+                role = (role_row[0] or "").lower()
+                if role in ADMIN_LIKE_ROLES or role != "member":
+                    return True
+            club = con.execute(text("SELECT owner_user_id FROM clubs WHERE id=:c"), {"c": club_id}).first()
+            return bool(club and club[0] == user_id)
+
+    def user_is_owner(club_id: int, user_id: int) -> bool:
+        with engine.begin() as con:
             club = con.execute(text("SELECT owner_user_id FROM clubs WHERE id=:c"), {"c": club_id}).first()
             return bool(club and club[0] == user_id)
 
@@ -299,42 +419,21 @@ def create_app():
               SELECT role FROM club_members WHERE club_id=:c AND user_id=:u
             """), {"c": club_id, "u": user_id}).first()
         is_member = row is not None
-        is_admin = bool(row and (row[0] in ADMIN_LIKE_ROLES or row[0].lower() != "member"))
+        is_admin = bool(row and ((row[0] or "").lower() in ADMIN_LIKE_ROLES or (row[0] or "").lower() != "member"))
         return is_member, is_admin
 
-    def send_mail(to_email: str, subject: str, html: str, text_body: str = None):
-        host = os.getenv("SMTP_HOST") or ""
-        user = os.getenv("SMTP_USER") or ""
-        pwd  = os.getenv("SMTP_PASS") or ""
-        port = int(os.getenv("SMTP_PORT", "587"))
-        from_addr = os.getenv("SMTP_FROM", "enfekte.co <no-reply@enfekte.co>")
-        use_tls = (os.getenv("SMTP_USE_TLS","true").lower() == "true")
-
-        if not host or not user or not pwd:
-            print("\n[DEV] SMTP boş: doğrulama e-postası gönderilmiyor.")
-            print("[DEV] TO:", to_email)
-            print("[DEV] SUBJECT:", subject)
-            print("[DEV] BODY:\n", html, "\n")
-            return
-
-        msg = EmailMessage()
-        msg["From"] = from_addr
-        msg["To"] = to_email
-        msg["Subject"] = subject
-        msg.set_content(text_body or "Please verify your email.")
-        msg.add_alternative(html, subtype="html")
-
-        ctx = ssl.create_default_context()
-        with smtplib.SMTP(host, port) as smtp:
-            if use_tls:
-                smtp.starttls(context=ctx)
-            smtp.login(user, pwd)
-            smtp.send_message(msg)
-
-    # ---------- Jinja filters ----------
+    # ---------- Templating ----------
     app.jinja_env.filters["ts"] = ts2human
 
-    # ===================== 1) ANASAYFA =====================
+    def try_render(tpl, **ctx):
+        try:
+            return render_template(tpl, **ctx)
+        except TemplateNotFound:
+            title = ctx.get("page_title") or "Sayfa"
+            body = ctx.get("fallback_html") or "<p>Şablon eksik.</p>"
+            return render_template_string(f"<!doctype html><title>{title}</title><div style='padding:20px;color:#eee;background:#111;font-family:system-ui'>{body}</div>")
+
+    # ===================== ANASAYFA =====================
     @app.get("/")
     def home():
         user = current_user()
@@ -352,7 +451,7 @@ def create_app():
                 """), {"u": user["id"]}).mappings().all()
 
                 my_events = con.execute(text("""
-                  SELECT e.*, c.name AS club_name
+                  SELECT e.*, c.name AS club_name, c.banner_url AS club_banner
                   FROM events e 
                   JOIN clubs c ON c.id=e.club_id
                   WHERE e.club_id IN (SELECT club_id FROM club_members WHERE user_id=:u)
@@ -361,7 +460,7 @@ def create_app():
                 """), {"u": user["id"]}).mappings().all()
 
             all_events = con.execute(text("""
-              SELECT e.*, c.name AS club_name
+              SELECT e.*, c.name AS club_name, e.banner_url AS event_banner, c.banner_url AS club_banner
               FROM events e 
               JOIN clubs c ON c.id=e.club_id
               ORDER BY COALESCE(e.starts_at, e.created_at) DESC
@@ -370,7 +469,7 @@ def create_app():
 
         return render_template("home.html", user=user, my_clubs=my_clubs, my_events=my_events, all_events=all_events)
 
-    # ===================== 2) PROFİL =====================
+    # ===================== PROFİL =====================
     @app.get("/profile")
     def profile():
         user = current_user()
@@ -383,9 +482,26 @@ def create_app():
               WHERE m.user_id=:u
               ORDER BY c.name
             """), {"u": user["id"]}).mappings().all()
-        return render_template("profile.html", user=user, memberships=memberships)
 
-    # ===================== 3) PANELLERİM =====================
+        # Fallback profil şablonu
+        fallback = f"""
+        <div style='display:flex;gap:20px;align-items:center'>
+          <img src='{user.get('avatar_url') or '/static/avatar-placeholder.png'}' alt='avatar' style='width:120px;height:120px;border-radius:50%;object-fit:cover;border:2px solid #333' />
+          <div>
+            <h2 style='margin:0'>{user.get('name','Kullanıcı')}</h2>
+            <div style='opacity:.7'>ID: {user.get('id')}</div>
+          </div>
+        </div>
+        <hr>
+        <h3>Üyeliklerim</h3>
+        <ul>
+        {''.join([f"<li>{m['name']} — <code>{m['role']}</code></li>" for m in memberships]) or '<li>Yok</li>'}
+        </ul>
+        """
+        return try_render("profile.html", user=user, memberships=memberships,
+                          page_title="Profil", fallback_html=fallback)
+
+    # ===================== PANELLERİM =====================
     @app.get("/panellerim")
     def my_panels():
         user = current_user()
@@ -396,12 +512,12 @@ def create_app():
               SELECT c.*
               FROM club_members m 
               JOIN clubs c ON c.id=m.club_id
-              WHERE m.user_id=:u AND (m.role IN :roles OR lower(m.role) != 'member')
+              WHERE m.user_id=:u AND (LOWER(m.role) IN :roles OR LOWER(m.role) != 'member')
               ORDER BY c.created_at DESC
             """).bindparams(roles=tuple(ADMIN_LIKE_ROLES)), {"u": user["id"]}).mappings().all()
         return render_template("panels.html", user=user, admin_clubs=admin_clubs)
 
-    # ===================== 4) KULÜP PANELİ =====================
+    # ===================== KULÜP PANELİ =====================
     @app.get("/clubs/<int:club_id>")
     def club_dashboard(club_id):
         user = current_user()
@@ -410,8 +526,7 @@ def create_app():
 
         with engine.begin() as con:
             club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": club_id}).mappings().first()
-            if not club:
-                abort(404)
+            if not club: abort(404)
 
             members = con.execute(text("""
               SELECT u.id, u.name, u.avatar_url, m.role
@@ -433,14 +548,113 @@ def create_app():
             """), {"c": club_id}).mappings().all()
 
         owner = is_admin_or_owner(club_id, user["id"])
-        return render_template("club_dashboard.html", user=user, club=club, members=members, meetings=meetings, events=events, owner=owner)
+        # Fallback bannerli görünüm
+        fallback = f"""
+        <div style="position:relative;border-radius:16px;overflow:hidden;border:1px solid #222">
+          <div style="height:180px;background:#222 url('{club.get('banner_url') or ''}') center/cover no-repeat"></div>
+          <div style="padding:16px">
+            <h2 style="margin:0">{club['name']}</h2>
+            <div style="opacity:.7">Kulüp #{club['id']}</div>
+          </div>
+        </div>
+        <div style="margin-top:16px;display:flex;gap:24px;flex-wrap:wrap">
+          <a href="{url_for('club_members', club_id=club_id)}">Üyeler & Roller</a>
+          <a href="{url_for('club_graph', club_id=club_id)}">Grafik (beta)</a>
+          <a href="{url_for('club_analytics', club_id=club_id)}">Analitik</a>
+        </div>
+        """
+        return try_render("club_dashboard.html", user=user, club=club, members=members,
+                          meetings=meetings, events=events, owner=owner,
+                          page_title=f"{club['name']}", fallback_html=fallback)
 
-    # ===================== ANALİZ SAYFALARI =====================
+    # ===================== ÜYELER & ROLLER =====================
+    @app.get("/clubs/<int:club_id>/members")
+    def club_members(club_id):
+        user = current_user()
+        if not user: return redirect(url_for("home"))
+        if not user_is_owner(club_id, user["id"]):
+            flash("Sadece kulüp kurucusu (owner) roller atayabilir.", "warning")
+            return redirect(url_for("club_dashboard", club_id=club_id))
 
+        with engine.begin() as con:
+            club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": club_id}).mappings().first()
+            members = con.execute(text("""
+              SELECT u.id, u.name, u.avatar_url, COALESCE(LOWER(m.role),'member') AS role
+              FROM club_members m JOIN users u ON u.id=m.user_id
+              WHERE m.club_id=:c
+              ORDER BY u.name
+            """), {"c": club_id}).mappings().all()
+
+        roles = sorted({"member"} | ADMIN_LIKE_ROLES - {"owner"})  # owner ataması buradan yapılmaz
+        options = "".join([f"<option value='{r}'>{{{{ 'selected' if m.role=='{r}' else '' }}}}{r}</option>" for r in roles])
+
+        # Fallback form
+        rows = []
+        for m in members:
+            rows.append(f"""
+            <tr>
+              <td style='display:flex;gap:8px;align-items:center'>
+                <img src='{m.get('avatar_url') or '/static/avatar-placeholder.png'}' style='width:28px;height:28px;border-radius:50%;object-fit:cover' />
+                {m['name']}
+              </td>
+              <td><code>{m['role']}</code></td>
+              <td>
+                <form method="POST" action="{url_for('club_set_role', club_id=club_id)}">
+                  <input type="hidden" name="user_id" value="{m['id']}"/>
+                  <select name="role">
+                    {''.join([f"<option value='{r}' {'selected' if m['role']==r else ''}>{r}</option>" for r in roles])}
+                  </select>
+                  <button>Kaydet</button>
+                </form>
+              </td>
+            </tr>
+            """)
+
+        table = f"""
+        <h2>Üyeler & Roller</h2>
+        <table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse">
+          <tr><th>Üye</th><th>Mevcut Rol</th><th>Rol Ata</th></tr>
+          {''.join(rows)}
+        </table>
+        <p style='opacity:.7'>Not: <code>owner</code> değişikliği bu ekrandan yapılmaz.</p>
+        """
+        return try_render("club_members.html", user=user, club=club, members=members,
+                          roles=roles, page_title="Üyeler & Roller", fallback_html=table)
+
+    @app.post("/clubs/<int:club_id>/members/role")
+    def club_set_role(club_id):
+        user = current_user()
+        if not user: return abort(401)
+        if not user_is_owner(club_id, user["id"]):
+            return abort(403)
+
+        target_uid = request.form.get("user_id", type=int)
+        new_role   = (request.form.get("role") or "member").strip().lower()
+        allowed = {"member"} | ADMIN_LIKE_ROLES - {"owner"}
+        if new_role not in allowed:
+            flash("Geçersiz rol.", "danger")
+            return redirect(url_for("club_members", club_id=club_id))
+
+        with engine.begin() as con:
+            exists = con.execute(text("""
+              SELECT 1 FROM club_members WHERE club_id=:c AND user_id=:u
+            """), {"c": club_id, "u": target_uid}).first()
+            if exists:
+                con.execute(text("""
+                  UPDATE club_members SET role=:r WHERE club_id=:c AND user_id=:u
+                """), {"r": new_role, "c": club_id, "u": target_uid})
+            else:
+                con.execute(text("""
+                  INSERT INTO club_members (club_id,user_id,role,joined_at)
+                  VALUES (:c,:u,:r,:t)
+                """), {"c": club_id, "u": target_uid, "r": new_role, "t": now_ts()})
+        flash("Rol güncellendi.", "success")
+        return redirect(url_for("club_members", club_id=club_id))
+
+    # ===================== ANALİZ SAYFALARI (yalnız admin-like) =====================
     def _event_analytics_impl(event_id):
         user = current_user()
-        if not user: 
-            return redirect(url_for("home"))
+        if not user: return redirect(url_for("home"))
 
         with engine.begin() as con:
             ev = con.execute(text("SELECT * FROM events WHERE id=:id"), {"id": event_id}).mappings().first()
@@ -449,9 +663,9 @@ def create_app():
             if not club: abort(404)
 
             is_member, is_admin = user_membership(ev["club_id"], user["id"])
-            if not is_member:
-                flash("Bu analizi görmek için kulüp üyesi olmalısın.", "warning")
-                return redirect(url_for("home"))
+            if not is_admin:
+                flash("Etkinlik analitiğine sadece admin-like profiller erişebilir.", "warning")
+                return redirect(url_for("club_dashboard", club_id=ev["club_id"]))
 
             attendees = con.execute(text("""
               SELECT u.id, u.name, u.avatar_url, u.edu_email, ci.checked_at
@@ -480,14 +694,11 @@ def create_app():
                 ids = [x["id"] for x in events_all]
                 try:
                     idx = ids.index(ev["id"])
-                    if idx < len(ids) - 1:
-                        next_id = ids[idx+1]
+                    if idx < len(ids) - 1: next_id = ids[idx+1]
                 except ValueError:
                     pass
 
             total_att = len(attendees)
-            edu_verified = sum(1 for a in attendees if a.get("edu_email"))
-
             continued = 0
             if next_id and total_att > 0:
                 ids = [str(a["id"]) for a in attendees]
@@ -503,16 +714,20 @@ def create_app():
         att_rate = (total_att / member_count * 100.0) if member_count else 0.0
         cont_rate = (continued / total_att * 100.0) if total_att else 0.0
 
-        return render_template("event_analytics.html",
-                               user=user, club=club, event=ev,
-                               attendees=attendees,
-                               member_count=member_count,
-                               total_att=total_att,
-                               att_rate=att_rate,
-                               edu_verified=edu_verified,
-                               new_edges_after=new_edges_after,
-                               continued=continued,
-                               cont_rate=cont_rate)
+        # Fallback: basit rapor
+        fallback = f"""
+        <h2>{club['name']} · {ev['title']} (Analitik)</h2>
+        <div>Katılım: <b>{total_att}</b> / Üye: <b>{member_count}</b> → <b>{att_rate:.1f}%</b></div>
+        <div>Bir sonraki etkinliğe geri dönenler: <b>{continued}</b> → <b>{cont_rate:.1f}%</b></div>
+        <div>Yeni bağlantılar (sonrasında): <b>{new_edges_after}</b></div>
+        """
+        return try_render("event_analytics.html",
+                          user=user, club=club, event=ev,
+                          attendees=attendees,
+                          member_count=member_count, total_att=total_att,
+                          att_rate=att_rate, continued=continued, cont_rate=cont_rate,
+                          new_edges_after=new_edges_after,
+                          page_title="Etkinlik Analitiği", fallback_html=fallback)
 
     @app.get("/events/<int:event_id>/analysis")
     def event_analytics(event_id):
@@ -522,28 +737,17 @@ def create_app():
     def event_analytics_alias(event_id):
         return _event_analytics_impl(event_id)
 
-    @app.get("/clubs/<int:club_id>/analysis")
-    def club_analysis(club_id):
-        user = current_user()
-        if not user: return redirect(url_for("home"))
-        is_member, _ = user_membership(club_id, user["id"])
-        if not is_member:
-            flash("Bu analizi görmek için kulüp üyesi olmalısın.", "warning")
-            return redirect(url_for("home"))
-        return redirect(url_for("club_analytics", club_id=club_id))
-
     @app.get("/clubs/<int:club_id>/analytics")
     def club_analytics(club_id):
         user = current_user()
         if not user: return redirect(url_for("home"))
-        is_member, _ = user_membership(club_id, user["id"])
-        if not is_member:
-            flash("Bu analizi görmek için kulüp üyesi olmalısın.", "warning")
-            return redirect(url_for("home"))
+        is_member, is_admin = user_membership(club_id, user["id"])
+        if not is_admin:
+            flash("Kulüp analitiğine sadece admin-like profiller erişebilir.", "warning")
+            return redirect(url_for("club_dashboard", club_id=club_id))
 
         with engine.begin() as con:
             club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": club_id}).mappings().first()
-
             events = con.execute(text("""
               SELECT e.id, e.title, e.category, e.starts_at, e.created_at,
                      COALESCE(e.starts_at, e.created_at) AS tkey,
@@ -565,78 +769,168 @@ def create_app():
                 for ev_id, uid in allcis:
                     attendees_by_event[ev_id].add(uid)
 
-            retention_pairs = []
-            for i in range(len(events)-1):
-                a = attendees_by_event.get(events[i]["id"], set())
-                b = attendees_by_event.get(events[i+1]["id"], set())
-                rate = (len(a & b) / len(a) * 100.0) if a else 0.0
-                retention_pairs.append({
-                    "from_event_id": events[i]["id"],
-                    "to_event_id": events[i+1]["id"],
-                    "from_title": events[i]["title"],
-                    "to_title": events[i+1]["title"],
-                    "rate": rate,
-                    "from_count": len(a),
-                    "both_count": len(a & b)
-                })
-            avg_retention = (sum(p["rate"] for p in retention_pairs) / len(retention_pairs)) if retention_pairs else 0.0
-
-            active_user_ids = set()
-            for s in attendees_by_event.values(): active_user_ids |= s
-            users_meta = {}
-            if active_user_ids:
-                placeholders = ",".join([str(uid) for uid in active_user_ids])
-                uq = text(f"SELECT id, name, avatar_url FROM users WHERE id IN ({placeholders})")
-                for r in con.execute(uq).all():
-                    users_meta[r[0]] = {"id": r[0], "name": r[1], "avatar_url": r[2]}
-
-            top_participants = []
-            active_counts = []
-            for uid in active_user_ids:
-                cnt = sum(1 for ev_id in event_ids if uid in attendees_by_event.get(ev_id, set()))
-                active_counts.append((uid, cnt))
-            active_counts.sort(key=lambda x: x[1], reverse=True)
-            for uid, cnt in active_counts[:5]:
-                meta = users_meta.get(uid, {"name": f"User {uid}"})
-                top_participants.append({"user_id": uid, "name": meta.get("name"), "avatar_url": meta.get("avatar_url"), "count": cnt})
-
-            degrees = {}
-            edges = con.execute(text("""
-                SELECT src_user_id, dst_user_id FROM graph_edges 
-                WHERE club_id=:c AND status='accepted'
-            """), {"c": club_id}).all()
-            for s, d in edges:
-                degrees[s] = degrees.get(s, 0) + 1
-                degrees[d] = degrees.get(d, 0) + 1
-            degree_sorted = sorted(degrees.items(), key=lambda x: x[1], reverse=True)
-            top_connectors = []
-            for uid, deg in degree_sorted[:5]:
-                meta = users_meta.get(uid)
-                if not meta:
-                    m = con.execute(text("SELECT name, avatar_url FROM users WHERE id=:i"), {"i": uid}).first()
-                    meta = {"name": m[0] if m else f"User {uid}", "avatar_url": m[1] if m else None}
-                top_connectors.append({"user_id": uid, "name": meta["name"], "avatar_url": meta["avatar_url"], "degree": deg})
-
-        trend = [{"event_id": e["id"], "title": e["title"], "category": (e["category"] or "event"),
-                  "t": e["tkey"], "count": e["checkin_count"]} for e in events]
-
         total_events = len(events)
         total_checkins = sum(e["checkin_count"] for e in events)
         unique_attendees = len({uid for s in attendees_by_event.values() for uid in s})
-        repeaters = sum(1 for _, c in active_counts if c >= 2)
+        repeaters = sum(1 for uid in {uid for s in attendees_by_event.values() for uid in s}
+                        if sum(1 for ev_id in event_ids if uid in attendees_by_event.get(ev_id, set())) >= 2)
 
-        return render_template("club_analysis.html",
-                               user=user, club=club, events=events,
-                               member_count=member_count, trend=trend,
-                               total_events=total_events,
-                               total_checkins=total_checkins,
-                               unique_attendees=unique_attendees,
-                               repeaters=repeaters,
-                               avg_retention=avg_retention,
-                               top_participants=top_participants,
-                               top_connectors=top_connectors)
+        fallback = f"""
+        <h2>{club['name']} · Analitik</h2>
+        <div>Etkinlik sayısı: <b>{total_events}</b></div>
+        <div>Toplam yoklama: <b>{total_checkins}</b></div>
+        <div>Tekil katılımcı: <b>{unique_attendees}</b></div>
+        <div>En az 2 etkinliğe katılan: <b>{repeaters}</b></div>
+        """
+        return try_render("club_analysis.html",
+                          user=user, club=club, events=events,
+                          member_count=member_count,
+                          total_events=total_events,
+                          total_checkins=total_checkins,
+                          unique_attendees=unique_attendees,
+                          repeaters=repeaters,
+                          page_title="Kulüp Analitiği", fallback_html=fallback)
 
-    # ===================== EVENT OLUŞTURMA / QR =====================
+    # ===================== GRAF (D3) + TIMELAPSE =====================
+    @app.get("/clubs/<int:club_id>/graph")
+    def club_graph(club_id):
+        user = current_user()
+        if not user: return redirect(url_for("home"))
+        _, is_admin = user_membership(club_id, user["id"])
+        if not is_admin:
+            flash("Grafiği sadece admin-like profiller görebilir.", "warning")
+            return redirect(url_for("club_dashboard", club_id=club_id))
+
+        with engine.begin() as con:
+            club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": club_id}).mappings().first()
+            max_ts = con.execute(text("SELECT MAX(created_at) FROM graph_edges WHERE club_id=:c"), {"c": club_id}).scalar() or now_ts()
+
+        # Fallback: inline D3 sayfası
+        fallback = f"""
+        <h2>{club['name']} · Ağ Haritası (beta)</h2>
+        <div id="graph" style="width:100%;height:520px;border:1px solid #222;border-radius:12px"></div>
+        <div style="margin-top:8px">
+          <input id="timeRange" type="range" min="0" max="{int(max_ts)}" value="{int(max_ts)}" style="width:100%" />
+          <div style="display:flex;justify-content:space-between;font-size:12px;opacity:.7">
+            <span>başlangıç</span><span>şimdi</span>
+          </div>
+        </div>
+        <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+        <script>
+        const clubId = {club_id};
+        const graphEl = document.getElementById('graph');
+        const slider  = document.getElementById('timeRange');
+
+        let svg, width, height, simulation, link, node, label;
+        function init(){
+          width = graphEl.clientWidth; height = graphEl.clientHeight;
+          svg = d3.select('#graph').append('svg')
+            .attr('width', width).attr('height', height)
+            .style('background','#111');
+          link = svg.append('g').attr('stroke','#555').attr('stroke-opacity',0.6).selectAll('line');
+          node = svg.append('g').attr('stroke','#fff').attr('stroke-width',1).selectAll('circle');
+          label= svg.append('g').selectAll('text');
+          simulation = d3.forceSimulation().force('link', d3.forceLink().id(d=>d.id).distance(60))
+                                           .force('charge', d3.forceManyBody().strength(-180))
+                                           .force('center', d3.forceCenter(width/2, height/2));
+          fetchAndRender();
+        }
+
+        function fetchAndRender(){
+          const until = slider.value;
+          fetch(`/clubs/${{clubId}}/graph.json?until=${{until}}`).then(r=>r.json()).then(data=>{
+            link = link.data(data.edges, d=>d.source+'-'+d.target);
+            link.exit().remove();
+            link = link.enter().append('line').merge(link);
+
+            node = node.data(data.nodes, d=>d.id);
+            node.exit().remove();
+            node = node.enter().append('circle')
+              .attr('r', 10)
+              .attr('fill', '#2e8bfa')
+              .call(drag(simulation))
+              .merge(node);
+
+            label = label.data(data.nodes, d=>d.id);
+            label.exit().remove();
+            label = label.enter().append('text')
+              .text(d=>d.label)
+              .attr('fill','#ddd')
+              .attr('font-size',11)
+              .merge(label);
+
+            simulation.nodes(data.nodes).on('tick', ticked);
+            simulation.force('link').links(data.edges);
+            simulation.alpha(0.8).restart();
+          });
+        }
+
+        function ticked(){
+          link.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y)
+              .attr('x2', d=>d.target.x).attr('y2', d=>d.target.y);
+          node.attr('cx', d=>d.x).attr('cy', d=>d.y);
+          label.attr('x', d=>d.x+12).attr('y', d=>d.y+4);
+        }
+
+        function drag(sim){
+          function dragstarted(event, d){
+            if (!event.active) sim.alphaTarget(0.3).restart();
+            d.fx = d.x; d.fy = d.y;
+          }
+          function dragged(event,d){ d.fx = event.x; d.fy = event.y; }
+          function dragended(event,d){
+            if (!event.active) sim.alphaTarget(0);
+            d.fx = null; d.fy = null;
+          }
+          return d3.drag().on('start',dragstarted).on('drag',dragged).on('end',dragended);
+        }
+
+        slider.addEventListener('input', fetchAndRender);
+        window.addEventListener('resize', ()=>{{ d3.select('#graph svg').remove(); init(); }});
+        init();
+        </script>
+        """
+        return try_render("club_graph.html", user=user, club=club,
+                          page_title="Ağ Haritası", fallback_html=fallback)
+
+    @app.get("/clubs/<int:club_id>/graph.json")
+    def club_graph_json(club_id):
+        user = current_user()
+        if not user: return {"error": "auth"}, 401
+        _, is_admin = user_membership(club_id, user["id"])
+        if not is_admin:
+            return {"error": "forbidden"}, 403
+        until = request.args.get("until", type=float)  # epoch
+        with engine.begin() as con:
+            nodes_rows = con.execute(text("""
+              SELECT u.id AS id, u.name AS label, u.avatar_url AS avatar
+              FROM club_members m JOIN users u ON u.id=m.user_id
+              WHERE m.club_id=:c
+            """), {"c": club_id}).mappings().all()
+            if until:
+                edges_rows = con.execute(text("""
+                  SELECT src_user_id AS source, dst_user_id AS target
+                  FROM graph_edges 
+                  WHERE club_id=:c AND status='accepted' AND created_at <= :t
+                """), {"c": club_id, "t": until}).mappings().all()
+            else:
+                edges_rows = con.execute(text("""
+                  SELECT src_user_id AS source, dst_user_id AS target
+                  FROM graph_edges 
+                  WHERE club_id=:c AND status='accepted'
+                """), {"c": club_id}).mappings().all()
+        nodes = [dict(r) for r in nodes_rows]
+        edges = [dict(r) for r in edges_rows]
+        return {"nodes": nodes, "edges": edges}
+
+    # ===================== EVENT / BANNER / QR =====================
+    def _parse_dt_local(dt_str):
+        if not dt_str: return None
+        try:
+            import datetime as dt
+            return time.mktime(dt.datetime.strptime(dt_str, "%Y-%m-%dT%H:%M").timetuple())
+        except Exception:
+            return None
 
     @app.get("/clubs/<int:club_id>/events/new")
     def event_new(club_id):
@@ -645,7 +939,22 @@ def create_app():
         if not is_admin_or_owner(club_id, user["id"]):
             flash("Bu kulüpte etkinlik oluşturma yetkin yok.", "danger")
             return redirect(url_for("club_dashboard", club_id=club_id))
-        return render_template("event_create.html", user=user, club_id=club_id)
+        # basit fallback form
+        fallback = f"""
+        <h2>Etkinlik Oluştur</h2>
+        <form method="POST" enctype="multipart/form-data" action="{url_for('event_new_post', club_id=club_id)}" style="display:grid;gap:8px;max-width:480px">
+          <input name="title" placeholder="Başlık" required />
+          <select name="category">
+            <option value="event" selected>Etkinlik</option>
+            <option value="meeting">Toplantı</option>
+          </select>
+          <label>Başlangıç: <input type="datetime-local" name="starts_at"></label>
+          <label>Bitiş: <input type="datetime-local" name="ends_at"></label>
+          <label>Banner: <input type="file" name="banner" accept="image/*"></label>
+          <button>Oluştur</button>
+        </form>"""
+        return try_render("event_create.html", user=user, club_id=club_id,
+                          page_title="Etkinlik Oluştur", fallback_html=fallback)
 
     @app.post("/clubs/<int:club_id>/events/new")
     def event_new_post(club_id):
@@ -654,46 +963,66 @@ def create_app():
         if not is_admin_or_owner(club_id, user["id"]):
             flash("Bu kulüpte etkinlik oluşturma yetkin yok.", "danger")
             return redirect(url_for("club_dashboard", club_id=club_id))
+
         title = (request.form.get("title") or "").strip()
         category = (request.form.get("category") or "event").strip()
-        starts = (request.form.get("starts_at") or "").strip()
-        ends   = (request.form.get("ends_at") or "").strip()
+        starts_at = _parse_dt_local(request.form.get("starts_at"))
+        ends_at   = _parse_dt_local(request.form.get("ends_at"))
         if not title:
             flash("Başlık gerekli.", "danger")
             return redirect(url_for("event_new", club_id=club_id))
-        def parse_dt(s):
-            if not s: return None
-            try:
-                import datetime as dt
-                return time.mktime(dt.datetime.strptime(s, "%Y-%m-%dT%H:%M").timetuple())
-            except Exception:
-                return None
-        starts_at = parse_dt(starts)
-        ends_at   = parse_dt(ends)
         qr_secret = secrets.token_urlsafe(16)
+        banner_url = None
+
+        # önce event kaydı
         with engine.begin() as con:
             if is_postgres(engine):
                 event_id = insert_with_returning(
-                    con, engine,
-                    sql_sqlite="",
-                    sql_pg="""
+                    con, engine, sql_sqlite="", sql_pg="""
                       INSERT INTO events (club_id, title, category, starts_at, ends_at, qr_secret, created_by, created_at)
-                      VALUES (:c,:t,:cat,:s,:e,:q,:u,:now)
-                      RETURNING id
+                      VALUES (:c,:t,:cat,:s,:e,:q,:u,:now) RETURNING id
                     """,
                     params={"c": club_id, "t": title, "cat": category, "s": starts_at, "e": ends_at, "q": qr_secret, "u": user["id"], "now": now_ts()}
                 )
             else:
                 event_id = insert_with_returning(
-                    con, engine,
-                    sql_sqlite="""
+                    con, engine, sql_sqlite="""
                       INSERT INTO events (club_id, title, category, starts_at, ends_at, qr_secret, created_by, created_at)
                       VALUES (:c,:t,:cat,:s,:e,:q,:u,:now)
-                    """,
-                    sql_pg="",
+                    """, sql_pg="",
                     params={"c": club_id, "t": title, "cat": category, "s": starts_at, "e": ends_at, "q": qr_secret, "u": user["id"], "now": now_ts()}
                 )
+
+        # banner yüklendiyse kaydet
+        try:
+            if "banner" in request.files and request.files["banner"].filename:
+                banner_url = _file_to_local(request.files["banner"], os.path.join(EVENT_DIR, str(event_id)), "banner")
+                with engine.begin() as con:
+                    con.execute(text("UPDATE events SET banner_url=:b WHERE id=:id"), {"b": banner_url, "id": event_id})
+        except Exception as e:
+            if DEBUG_TRACE: traceback.print_exc()
+            flash(f"Banner yüklemede sorun: {e}", "warning")
+
         flash("Etkinlik oluşturuldu.", "success")
+        return redirect(url_for("event_analytics", event_id=event_id))
+
+    @app.post("/events/<int:event_id>/banner")
+    def event_upload_banner(event_id):
+        user = current_user()
+        if not user: return abort(401)
+        with engine.begin() as con:
+            ev = con.execute(text("SELECT id, club_id, created_by FROM events WHERE id=:id"), {"id": event_id}).mappings().first()
+            if not ev: return abort(404)
+        if not (is_admin_or_owner(ev["club_id"], user["id"]) or ev["created_by"] == user["id"]):
+            return abort(403)
+        try:
+            banner_url = _file_to_local(request.files["banner"], os.path.join(EVENT_DIR, str(event_id)), "banner")
+            with engine.begin() as con:
+                con.execute(text("UPDATE events SET banner_url=:b WHERE id=:id"), {"b": banner_url, "id": event_id})
+            flash("Banner güncellendi.", "success")
+        except Exception as e:
+            if DEBUG_TRACE: traceback.print_exc()
+            flash(f"Banner yüklenemedi: {e}", "danger")
         return redirect(url_for("event_analytics", event_id=event_id))
 
     @app.get("/events/<int:event_id>/live")
@@ -706,7 +1035,6 @@ def create_app():
             club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": ev["club_id"]}).mappings().first()
             if not club: abort(404)
 
-        # admin-like veya etkinliği oluşturan kişi
         if not (is_admin_or_owner(ev["club_id"], user["id"]) or ev["created_by"] == user["id"]):
             flash("Bu etkinliğin canlı ekranına erişimin yok.", "danger")
             return redirect(url_for("event_analytics", event_id=event_id))
@@ -714,7 +1042,19 @@ def create_app():
         with engine.begin() as con:
             cnt = con.execute(text("SELECT COUNT(*) FROM checkins WHERE event_id=:e"), {"e": event_id}).scalar() or 0
         join_url = app.config["HOST_URL"].rstrip("/") + url_for("join") + f"?e={event_id}&q={quote(ev['qr_secret'])}"
-        return render_template("event_live_qr.html", user=user, event=ev, club=club, join_url=join_url, count=cnt)
+
+        fallback = f"""
+        <div style="position:relative;border-radius:16px;overflow:hidden;border:1px solid #222;margin-bottom:12px">
+          <div style="height:220px;background:#222 url('{ev.get('banner_url') or ''}') center/cover no-repeat"></div>
+          <div style="padding:16px"><h2 style="margin:0">{ev['title']}</h2></div>
+        </div>
+        <p>Toplam katılımcı: <b>{cnt}</b></p>
+        <img src="{url_for('event_qr_png', event_id=event_id)}" alt="QR" style="width:260px;height:260px;border:8px solid #fff;border-radius:12px" />
+        <p style="opacity:.7">Katılım linki: <a href="{join_url}">{join_url}</a></p>
+        """
+        return try_render("event_live_qr.html", user=user, event=ev, club=club,
+                          join_url=join_url, count=cnt,
+                          page_title="Canlı Yoklama Ekranı", fallback_html=fallback)
 
     @app.get("/events/<int:event_id>/qr.png")
     def event_qr_png(event_id):
@@ -723,7 +1063,6 @@ def create_app():
         with engine.begin() as con:
             ev = con.execute(text("SELECT id, qr_secret, club_id, created_by FROM events WHERE id=:id"), {"id": event_id}).mappings().first()
             if not ev: abort(404)
-        # admin-like veya etkinliği oluşturan kişi
         if not (is_admin_or_owner(ev["club_id"], user["id"]) or ev["created_by"] == user["id"]):
             return abort(403)
         join_url = app.config["HOST_URL"].rstrip("/") + url_for("join") + f"?e={event_id}&q={quote(ev['qr_secret'])}"
@@ -735,7 +1074,6 @@ def create_app():
 
     @app.get("/events/<int:event_id>/export.csv")
     def event_export_csv(event_id):
-        """Katılımcı listesini CSV olarak indir (admin-like veya etkinliği oluşturan)."""
         user = current_user()
         if not user: return abort(401)
         with engine.begin() as con:
@@ -793,35 +1131,28 @@ def create_app():
         flash("Yoklamaya eklendin. Hoş geldin! 👋", "success")
         return redirect(url_for("event_analytics", event_id=e))
 
-    # ---------- JSON graph ----------
-    @app.get("/clubs/<int:club_id>/graph.json")
-    def club_graph_json(club_id):
+    # ===================== KULÜP BANNER / LOGO YÜKLEME =====================
+    @app.post("/clubs/<int:club_id>/banner")
+    def club_upload_banner(club_id):
         user = current_user()
-        if not user: return {"error": "auth"}, 401
-        with engine.begin() as con:
-            mem = con.execute(text("""
-              SELECT 1 FROM club_members WHERE club_id=:c AND user_id=:u
-            """), {"c": club_id, "u": user["id"]}).first()
-            if not mem:
-                return {"error": "forbidden"}, 403
-            nodes_rows = con.execute(text("""
-              SELECT u.id AS id, u.name AS label, u.avatar_url AS avatar
-              FROM club_members m JOIN users u ON u.id=m.user_id
-              WHERE m.club_id=:c
-            """), {"c": club_id}).mappings().all()
-            edges_rows = con.execute(text("""
-              SELECT src_user_id AS source, dst_user_id AS target
-              FROM graph_edges 
-              WHERE club_id=:c AND status='accepted'
-            """), {"c": club_id}).mappings().all()
-        nodes = [dict(r) for r in nodes_rows]
-        edges = [dict(r) for r in edges_rows]
-        if DEBUG_TRACE:
-            print(f"[DEBUG] graph json club={club_id} nodes={len(nodes)} edges={len(edges)}")
-        return {"nodes": nodes, "edges": edges}
+        if not user: return abort(401)
+        if not is_admin_or_owner(club_id, user["id"]): return abort(403)
+        try:
+            if "banner" in request.files and request.files["banner"].filename:
+                b_url = _file_to_local(request.files["banner"], os.path.join(CLUB_DIR, str(club_id)), "banner")
+                with engine.begin() as con:
+                    con.execute(text("UPDATE clubs SET banner_url=:b WHERE id=:id"), {"b": b_url, "id": club_id})
+            if "logo" in request.files and request.files["logo"].filename:
+                l_url = _file_to_local(request.files["logo"], os.path.join(CLUB_DIR, str(club_id)), "logo")
+                with engine.begin() as con:
+                    con.execute(text("UPDATE clubs SET logo_url=:l WHERE id=:id"), {"l": l_url, "id": club_id})
+            flash("Görseller güncellendi.", "success")
+        except Exception as e:
+            if DEBUG_TRACE: traceback.print_exc()
+            flash(f"Görsel yüklenemedi: {e}", "danger")
+        return redirect(url_for("club_dashboard", club_id=club_id))
 
     # ===================== SAĞLIK / HESAP / OAUTH =====================
-
     @app.get("/health")
     def health():
         return {"ok": True}
@@ -888,7 +1219,7 @@ def create_app():
                 timeout=20, verify=REQUESTS_VERIFY
             )
             if DEBUG_TRACE:
-                print("[DEBUG] accessToken status:", resp.status_code, "| body:", resp.text[:500])
+                print("[DEBUG] accessToken status:", resp.status_code, "| body:", resp.text[:400])
             if resp.status_code != 200:
                 flash("LinkedIn access token alınamadı.", "danger")
                 return redirect(url_for("home"))
@@ -898,8 +1229,7 @@ def create_app():
                 flash("Access token bulunamadı.", "danger")
                 return redirect(url_for("home"))
         except Exception:
-            print("[ERROR] Token exchange failed:")
-            traceback.print_exc()
+            if DEBUG_TRACE: traceback.print_exc()
             flash("Token değişiminde hata oluştu.", "danger")
             return redirect(url_for("home"))
 
@@ -908,22 +1238,19 @@ def create_app():
             "X-Restli-Protocol-Version": "2.0.0",
         }
 
-        sub = name = email = avatar = None
+        sub = name = email = avatar_remote = None
         try:
             uresp = requests.get("https://api.linkedin.com/v2/userinfo", headers=headers, timeout=15, verify=REQUESTS_VERIFY)
-            if DEBUG_TRACE:
-                print("[DEBUG] userinfo status:", uresp.status_code, "| body:", uresp.text[:500])
             if uresp.status_code == 200:
                 uj = uresp.json()
                 sub = uj.get("sub")
                 name = uj.get("name") or (uj.get("given_name","") + " " + uj.get("family_name","")).strip() or "LinkedIn User"
                 email = uj.get("email") or uj.get("emailAddress")
-                avatar = uj.get("picture")
+                avatar_remote = uj.get("picture")
         except Exception:
-            if DEBUG_TRACE:
-                print("[DEBUG] userinfo exception:")
-                traceback.print_exc()
+            if DEBUG_TRACE: traceback.print_exc()
 
+        # Fallback v2 endpoints
         try:
             if not sub:
                 me = requests.get(
@@ -933,13 +1260,12 @@ def create_app():
                 if me.status_code == 200:
                     mp = me.json()
                     sub = mp.get("id")
-                    first = mp.get("localizedFirstName","")
-                    last  = mp.get("localizedLastName","")
+                    first = mp.get("localizedFirstName",""); last = mp.get("localizedLastName","")
                     name = (first + " " + last).strip() or name or "LinkedIn User"
                     try:
                         pics = mp["profilePicture"]["displayImage~"]["elements"]
                         if pics:
-                            avatar = pics[-1]["identifiers"][0]["identifier"]
+                            avatar_remote = pics[-1]["identifiers"][0]["identifier"]
                     except Exception:
                         pass
             if not email:
@@ -954,41 +1280,48 @@ def create_app():
                     except Exception:
                         pass
         except Exception:
-            print("[ERROR] Fallback v2 endpoints failed:")
-            traceback.print_exc()
+            if DEBUG_TRACE: traceback.print_exc()
 
         if not sub:
             flash("LinkedIn kullanıcı bilgisi alınamadı. Lütfen tekrar deneyin.", "danger")
             return redirect(url_for("home"))
 
+        # Kullanıcıyı oluştur/güncelle
         with engine.begin() as con:
             row = con.execute(text("SELECT id FROM users WHERE linkedin_id=:lid"), {"lid": sub}).first()
             if row:
                 uid = row[0]
-                con.execute(text("UPDATE users SET name=:n, avatar_url=:a WHERE id=:id"),
-                            {"n": name, "a": avatar, "id": uid})
+                con.execute(text("UPDATE users SET name=:n WHERE id=:id"), {"n": name, "id": uid})
             else:
                 if is_postgres(engine):
                     uid = insert_with_returning(
-                        con, engine,
-                        sql_sqlite="",
-                        sql_pg="""
-                          INSERT INTO users (linkedin_id, name, avatar_url, edu_email)
-                          VALUES (:lid, :n, :a, :e)
-                          RETURNING id
-                        """,
-                        params={"lid": sub, "n": name, "a": avatar, "e": email}
+                        con, engine, sql_sqlite="", sql_pg="""
+                        INSERT INTO users (linkedin_id, name, avatar_url, edu_email)
+                        VALUES (:lid, :n, NULL, :e) RETURNING id
+                        """, params={"lid": sub, "n": name, "e": email}
                     )
                 else:
                     uid = insert_with_returning(
-                        con, engine,
-                        sql_sqlite="""
-                          INSERT INTO users (linkedin_id, name, avatar_url, edu_email)
-                          VALUES (:lid, :n, :a, :e)
-                        """,
-                        sql_pg="",
-                        params={"lid": sub, "n": name, "a": avatar, "e": email}
+                        con, engine, sql_sqlite="""
+                        INSERT INTO users (linkedin_id, name, avatar_url, edu_email)
+                        VALUES (:lid, :n, NULL, :e)
+                        """, sql_pg="", params={"lid": sub, "n": name, "e": email}
                     )
+
+        # Avatar'ı indir ve local'e kaydet (başarısız olursa remote URL'yi yaz)
+        avatar_url_final = None
+        if avatar_remote:
+            local_path = os.path.join(AVATAR_DIR, f"{uid}.jpg")
+            ok = _download_image_to_local(avatar_remote, local_path)
+            if ok:
+                web_rel = local_path.split(os.path.join(BASE_DIR, "static"))[-1].replace("\\","/")
+                avatar_url_final = "/static" + web_rel
+        if not avatar_url_final and avatar_remote:
+            avatar_url_final = avatar_remote
+
+        with engine.begin() as con:
+            con.execute(text("UPDATE users SET avatar_url=:a, avatar_cached_at=:t WHERE id=:id"),
+                        {"a": avatar_url_final, "t": now_ts(), "id": uid})
 
         session["uid"] = uid
         flash("Giriş başarılı.", "success")
@@ -998,8 +1331,7 @@ def create_app():
             return redirect(url_for("verify", next=nxt) if nxt else url_for("verify"))
         return redirect(nxt or url_for("home"))
 
-    # ===================== MISC =====================
-
+    # ===================== GLOBALS =====================
     @app.context_processor
     def inject_globals():
         return {"HOST_URL": app.config["HOST_URL"]}
