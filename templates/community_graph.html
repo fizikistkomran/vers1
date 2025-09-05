@@ -1,23 +1,28 @@
 {% extends "base.html" %}
 {% block title %}Topluluk Ağı • enfekte.co{% endblock %}
 {% block content %}
-  <h3>Topluluk Ağı</h3>
+  <h3 class="section-title">Topluluk Ağı</h3>
   <p class="muted">Bağ oluşturmak için kulüp panelinden “Tanıyorum” gönder, gelen istekleri kabul et.</p>
 
-  <div id="graph" style="width:100%; height:550px; border:1px solid #eee; border-radius:8px;"></div>
+  <div id="graph" style="width:100%; height:550px; border:1px solid var(--glass-stroke); border-radius:8px; background:rgba(0,0,0,.08)"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
   <script>
-    const width = document.getElementById('graph').clientWidth;
-    const height = document.getElementById('graph').clientHeight;
+    const wrap = document.getElementById('graph');
+    let width = wrap.clientWidth, height = wrap.clientHeight;
 
     const svg = d3.select("#graph").append("svg")
       .attr("width", width).attr("height", height);
 
+    // zoom/pan için bir grup
     const g = svg.append("g");
 
-    function avatarPattern(svg, id, href) {
-      const defs = svg.append("defs");
+    // defs sadece bir kez
+    const defs = svg.append("defs");
+
+    function ensureAvatarPattern(id, href){
+      // aynı id varsa tekrar ekleme
+      if (document.getElementById(id)) return;
       const pat = defs.append("pattern")
         .attr("id", id)
         .attr("width", 1).attr("height", 1)
@@ -28,48 +33,66 @@
         .attr("width", 1).attr("height", 1);
     }
 
+    // zoom & pan
+    const zoom = d3.zoom()
+      .scaleExtent([0.5, 3])
+      .on("zoom", (event) => { g.attr("transform", event.transform); });
+    svg.call(zoom);
+
+    // katmanlar
+    const linkLayer = g.append("g").attr("stroke","#ccc").attr("stroke-width",1.5);
+    const nodeLayer = g.append("g");
+    const labelLayer= g.append("g");
+
     fetch("{{ url_for('club_graph_json', club_id=club_id) }}")
-      .then(r => r.json())
+      .then(r => r.ok ? r.json() : Promise.reject(r.status))
       .then(data => {
         const nodes = data.nodes.map(d => ({...d}));
-        const links = data.edges.map(e => ({...e}));
+        let links  = data.edges.map(e => ({...e}));
 
-        links.forEach(l => {
-          l.source = nodes.find(n => n.id === l.source);
-          l.target = nodes.find(n => n.id === l.target);
-        });
+        // avatar pattern’ları
+        nodes.forEach(n => { if (n.avatar) ensureAvatarPattern("avatar-"+n.id, n.avatar); });
 
-        nodes.forEach(n => {
-          if (n.avatar) avatarPattern(svg, "avatar-"+n.id, n.avatar);
-        });
+        // source/target'ı node nesnelerine dönüştür
+        const byId = new Map(nodes.map(n => [n.id, n]));
+        links = links
+          .map(l => ({...l, source: byId.get(l.source), target: byId.get(l.target)}))
+          .filter(l => l.source && l.target); // eksik uçları ele
 
+        // simülasyon
         const sim = d3.forceSimulation(nodes)
           .force("link", d3.forceLink(links).id(d => d.id).distance(120))
           .force("charge", d3.forceManyBody().strength(-180))
           .force("center", d3.forceCenter(width/2, height/2));
 
-        const link = g.selectAll(".link")
-          .data(links).enter().append("line")
-          .attr("class","link")
-          .attr("stroke","#ccc").attr("stroke-width",1.5);
+        const link = linkLayer.selectAll("line")
+          .data(links)
+          .enter().append("line");
 
-        const node = g.selectAll(".node")
-          .data(nodes).enter().append("g")
-          .attr("class","node")
+        const node = nodeLayer.selectAll("g.node")
+          .data(nodes)
+          .enter().append("g").attr("class","node")
           .call(d3.drag()
             .on("start", (event,d)=>{ if(!event.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; })
             .on("drag",  (event,d)=>{ d.fx=event.x; d.fy=event.y; })
-            .on("end",   (event,d)=>{ if(!event.active) sim.alphaTarget(0); d.fx=null; d.fy=null; }));
+            .on("end",   (event,d)=>{ if(!event.active) sim.alphaTarget(0); d.fx=null; d.fy=null; })
+          );
+
+        node.append("title").text(d => d.label);
 
         node.append("circle")
           .attr("r", 18)
           .attr("fill", d => d.avatar ? `url(#avatar-${d.id})` : "#89a")
           .attr("stroke","#333").attr("stroke-width",0.5);
 
-        node.append("text")
-          .attr("x", 22).attr("y", 4)
-          .text(d => d.label)
-          .attr("font-size","12px");
+        const label = labelLayer.selectAll("text")
+          .data(nodes)
+          .enter().append("text")
+          .attr("font-size","12px")
+          .attr("paint-order","stroke")
+          .attr("stroke","#111").attr("stroke-width",2).attr("stroke-opacity",0.4)
+          .attr("fill","#eee")
+          .text(d => d.label);
 
         sim.on("tick", () => {
           link
@@ -79,7 +102,23 @@
             .attr("y2", d => d.target.y);
 
           node.attr("transform", d => `translate(${d.x},${d.y})`);
+          label.attr("x", d => d.x + 22).attr("y", d => d.y + 4);
         });
+
+        // resize desteği
+        window.addEventListener('resize', () => {
+          width = wrap.clientWidth; height = wrap.clientHeight;
+          svg.attr("width", width).attr("height", height);
+          sim.force("center", d3.forceCenter(width/2, height/2));
+          sim.alpha(0.5).restart();
+        }, { passive: true });
+      })
+      .catch(err => {
+        console.error("graph load error", err);
+        const box = document.createElement('div');
+        box.className = 'empty list';
+        box.textContent = 'Graf verisi yüklenemedi.';
+        wrap.appendChild(box);
       });
   </script>
 {% endblock %}

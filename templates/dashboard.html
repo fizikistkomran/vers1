@@ -1,30 +1,26 @@
 {% extends "base.html" %}
-{% block title %}Panel • enfekte.co{% endblock %}
+{% block title %}Panellerim • enfekte.co{% endblock %}
 {% block content %}
-  <h3>Benim Kulüplerim</h3>
-  <p class="muted">Kulüp oluştur veya bir kulübün etkinliğinde QR okutarak üyeliğin otomatik başlasın.</p>
-  <div class="btn-row">
-    <a role="button" href="{{ url_for('club_new') }}">+ Yeni Kulüp</a>
+
+<h2 class="section-title">Panellerim</h2>
+<p class="muted">Yönetici/owner olduğun kulüpler burada listelenir.</p>
+
+<div class="btn-row" style="margin-bottom:16px">
+  <a role="button" class="btn-badge" href="{{ url_for('club_new') }}">+ Yeni Kulüp</a>
+</div>
+
+{% if admin_clubs and admin_clubs|length > 0 %}
+  <div class="grid">
+    {% for c in admin_clubs %}
+      <a class="card" href="{{ url_for('club_dashboard', club_id=c.id) }}">
+        <div style="font-size:20px">{{ c.name }}</div>
+        <div class="meta">Oluşturulma: {{ c.created_at|ts }}</div>
+      </a>
+    {% endfor %}
   </div>
-  <hr />
-  {% if clubs %}
-    <div class="grid-2">
-      {% for c in clubs %}
-        <article>
-          <header><strong>{{ c.name }}</strong></header>
-          <p>
-            <span class="tag">Üye: {{ c.member_count }}</span>
-            <span class="tag">Etkinlik: {{ c.event_count }}</span>
-            <span class="muted">• {{ c.created_at|ts }}</span>
-          </p>
-          <footer class="btn-row">
-            <a role="button" href="{{ url_for('club_detail', club_id=c.id) }}">Kulüp Paneli</a>
-          </footer>
-        </article>
-      {% endfor %}
-    </div>
-  {% else %}
-    <p>Henüz kulüp yok. <a href="{{ url_for('club_new') }}">İlk kulübünü oluştur.</a></p>
-  {% endif %}
+{% else %}
+  <div class="empty list">Hiç kulüp panelin yok. <a class="link" href="{{ url_for('club_new') }}">İlk kulübünü oluştur.</a></div>
+{% endif %}
+
 {% endblock %}
 
