@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}enfekte.co{% endblock %}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <style>
+    :root{
+      --bg1:#0a0a0a; --bg2:#27227a; --bg3:#2f2edb;
+      --card1:#ff7ab6; --card2:#ffd86b;
+      --text:#ffffff; --muted:#c8c8d0;
+      --chip1:#ff6a6a; --chip2:#b57cff;
+      --glass: rgba(255,255,255,.08); --glass-stroke: rgba(255,255,255,.15);
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0;
+      font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial;
+      color:var(--text);
+      background:
+        radial-gradient(1200px 100% at -10% 50%, var(--bg1), transparent 60%),
+        linear-gradient(120deg, var(--bg2), var(--bg3));
+      min-height:100%;
+    }
+    a{color:inherit;text-decoration:none}
+    .container{max-width:1200px;margin:0 auto;padding:28px 20px 80px}
+    header{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+    .brand{font-weight:800;font-size:28px;letter-spacing:.5px}
+    .brand-sep{height:2px;background:var(--glass-stroke);margin-top:8px;margin-bottom:20px}
+    .actions{display:flex;gap:14px;align-items:center}
+    .btn-badge{
+      display:inline-flex;align-items:center;gap:8px;
+      padding:8px 14px;border-radius:999px;font-weight:700;font-size:14px;
+      background:linear-gradient(135deg,var(--chip1),var(--chip2));
+      border:1px solid rgba(255,255,255,.25);
+      box-shadow:0 6px 18px rgba(0,0,0,.25), inset 0 0 0 1px rgba(255,255,255,.15);
+      transition:transform .08s ease, opacity .15s ease; opacity:.95;
+    }
+    .btn-badge:hover{transform:translateY(-1px);opacity:1}
+    .avatar{
+      width:40px;height:40px;border-radius:50%;object-fit:cover;
+      border:2px solid rgba(255,255,255,.85); box-shadow:0 4px 14px rgba(0,0,0,.25);
+      display:block;
+    }
+    .section-title{font-size:20px;font-weight:800;margin:22px 0 12px}
+    .muted{color:var(--muted)}
+    .grid{display:grid;gap:18px;grid-template-columns:repeat(4,minmax(0,1fr))}
+    @media (max-width:1100px){.grid{grid-template-columns:repeat(3,1fr)}}
+    @media (max-width:780px){.grid{grid-template-columns:repeat(2,1fr)}}
+    @media (max-width:480px){.grid{grid-template-columns:1fr}}
+    .card{
+      border-radius:24px;padding:18px;background:linear-gradient(135deg,var(--card1),var(--card2));
+      color:#fff;font-weight:800;box-shadow:0 10px 26px rgba(0,0,0,.25);
+      min-height:110px;display:flex;flex-direction:column;justify-content:flex-end;
+      transition:transform .08s ease, box-shadow .12s ease, filter .12s ease; position:relative;overflow:hidden;
+    }
+    .card:hover{transform:translateY(-3px);box-shadow:0 14px 30px rgba(0,0,0,.32);filter:saturate(1.05)}
+    .card .club{position:absolute;top:10px;left:12px;font-size:12px;font-weight:700;opacity:.9}
+    .card .meta{font-size:13px;font-weight:700;opacity:.95}
+    .chip{
+      font-size:12px;font-weight:800;padding:6px 10px;border-radius:999px;
+      background:var(--glass); backdrop-filter: blur(8px);
+      border:1px solid var(--glass-stroke); display:inline-block;margin-bottom:8px;
+    }
+    .toolbar{display:flex;gap:10px;flex-wrap:wrap}
+    .toolbar a{padding:10px 14px;border-radius:12px;background:var(--glass);border:1px solid var(--glass-stroke);font-weight:700}
+    .list{background:rgba(255,255,255,.03);border:1px solid var(--glass-stroke);border-radius:16px;padding:14px}
+    .row{display:flex;gap:12px;align-items:center;padding:10px 6px;border-bottom:1px dashed rgba(255,255,255,.12)}
+    .row:last-child{border-bottom:none}
+    .pill{padding:6px 10px;border-radius:999px;background:rgba(255,255,255,.1);font-size:12px;font-weight:700}
+    .kbd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;opacity:.85}
+    .empty{opacity:.75;padding:16px}
+    .sub{font-size:13px;color:var(--muted)}
+    .link{border-bottom:1px dashed rgba(255,255,255,.5)}
+    footer{opacity:.6;font-size:12px;margin-top:50px}
+  </style>
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <div class="container">
+    <header role="banner" aria-label="Üst menü">
+      <div class="brand"><a href="{{ url_for('home') }}" aria-label="Anasayfa">enfekte.co</a></div>
+      <nav class="actions" aria-label="Hızlı işlemler">
+        {% if user %}
+          <a class="btn-badge" href="{{ url_for('my_panels') }}">panelim</a>
+          <a href="{{ url_for('profile') }}" title="Profil">
+            <img
+              class="avatar"
+              alt="Profil"
+              src="{{ (user.avatar_url if user and user.avatar_url else '/static/avatar-placeholder.png') }}"
+              loading="lazy"
+            />
+          </a>
+        {% else %}
+          <a class="btn-badge" href="{{ url_for('li_login') }}">giriş yap</a>
+        {% endif %}
+      </nav>
+    </header>
+    <div class="brand-sep" aria-hidden="true"></div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div class="list" style="margin-bottom:16px" role="region" aria-live="polite" aria-label="Bildirimler">
+          {% for cat,msg in messages %}
+            <div class="row">
+              <span class="pill">{{ cat }}</span>
+              <div>{{ msg }}</div>
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    {% block content %}{% endblock %}
+
+    <footer>© <span id="y"></span> enfekte.co</footer>
+  </div>
+
+  <script>
+    // Yılı otomatik yaz
+    (function(){ try{ document.getElementById('y').textContent = new Date().getFullYear(); }catch(e){} })();
+  </script>
+</body>
+</html>
+
