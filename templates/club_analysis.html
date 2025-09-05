@@ -9,18 +9,34 @@
   <div class="row"><div>Toplam check-in</div><div class="pill">{{ total_checkins }}</div></div>
   <div class="row"><div>Benzersiz katılımcı</div><div class="pill">{{ unique_attendees }}</div></div>
   <div class="row"><div>Tekrarlayan katılımcı</div><div class="pill">{{ repeaters }}</div></div>
-  <div class="row"><div>Ortalama ardışık etkinlik tutma</div><div class="pill">{{ '%.1f'|format(avg_retention) }}%</div></div>
+  {# avg_retention backend’den gelmiyor; varsa formatla, yoksa '-' göster #}
+  <div class="row">
+    <div>Ortalama ardışık etkinlik tutma</div>
+    <div class="pill">
+      {% if avg_retention is defined and avg_retention is not none %}
+        {{ '%.1f'|format(avg_retention) }}%
+      {% else %}
+        -
+      {% endif %}
+    </div>
+  </div>
 </div>
 
 <h2 class="section-title">Etkinlik/Toplantı Trend</h2>
-{% if trend %}
+{# backend şu anda 'events' listesini gönderiyor; onu kullan #}
+{% if events and events|length > 0 %}
   <div class="list">
-    {% for t in trend %}
+    {% for e in events %}
       <div class="row">
-        <div style="min-width:120px" class="pill">{{ (t.t)|ts }}</div>
-        <div style="flex:1">{{ t.title }} {% if (t.category or 'event')=='meeting' %}<span class="pill">Toplantı</span>{% endif %}</div>
-        <div class="pill">{{ t.count }}</div>
-        <a class="link" href="{{ url_for('event_analytics', event_id=t.event_id) }}">analiz</a>
+        <div style="min-width:120px" class="pill">{{ (e.tkey)|ts }}</div>
+        <div style="flex:1">
+          {{ e.title }}
+          {% if (e.category or 'event') == 'meeting' %}
+            <span class="pill">Toplantı</span>
+          {% endif %}
+        </div>
+        <div class="pill">{{ e.checkin_count }} kişi</div>
+        <a class="link" href="{{ url_for('event_analytics', event_id=e.id) }}">analiz</a>
       </div>
     {% endfor %}
   </div>
@@ -28,34 +44,47 @@
   <div class="empty list">Veri yok.</div>
 {% endif %}
 
-<h2 class="section-title">En aktif katılımcılar</h2>
-{% if top_participants %}
-  <div class="list">
-    {% for p in top_participants %}
-      <div class="row">
-        <span class="avatar"></span>
-        <div style="flex:1">{{ p.name }}</div>
-        <div class="pill">{{ p.count }} katılım</div>
-      </div>
-    {% endfor %}
-  </div>
-{% else %}
-  <div class="empty list">Veri yok.</div>
+{# aşağıdaki iki bölüm opsiyonel—yalnızca backend bu verileri sağlarsa göster #}
+{% if top_participants is defined %}
+  <h2 class="section-title">En aktif katılımcılar</h2>
+  {% if top_participants %}
+    <div class="list">
+      {% for p in top_participants %}
+        <div class="row">
+          {% if p.avatar_url %}
+            <img class="avatar" src="{{ p.avatar_url }}" alt="{{ p.name }}" style="width:32px;height:32px"/>
+          {% else %}
+            <span class="avatar" aria-hidden="true"></span>
+          {% endif %}
+          <div style="flex:1">{{ p.name }}</div>
+          <div class="pill">{{ p.count }} katılım</div>
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="empty list">Veri yok.</div>
+  {% endif %}
 {% endif %}
 
-<h2 class="section-title">En bağlayıcı üyeler</h2>
-{% if top_connectors %}
-  <div class="list">
-    {% for c in top_connectors %}
-      <div class="row">
-        <span class="avatar"></span>
-        <div style="flex:1">{{ c.name }}</div>
-        <div class="pill">{{ c.degree }} bağlantı</div>
-      </div>
-    {% endfor %}
-  </div>
-{% else %}
-  <div class="empty list">Veri yok.</div>
+{% if top_connectors is defined %}
+  <h2 class="section-title">En bağlayıcı üyeler</h2>
+  {% if top_connectors %}
+    <div class="list">
+      {% for c in top_connectors %}
+        <div class="row">
+          {% if c.avatar_url %}
+            <img class="avatar" src="{{ c.avatar_url }}" alt="{{ c.name }}" style="width:32px;height:32px"/>
+          {% else %}
+            <span class="avatar" aria-hidden="true"></span>
+          {% endif %}
+          <div style="flex:1">{{ c.name }}</div>
+          <div class="pill">{{ c.degree }} bağlantı</div>
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="empty list">Veri yok.</div>
+  {% endif %}
 {% endif %}
 
 {% endblock %}
