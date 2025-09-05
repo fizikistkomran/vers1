@@ -35,6 +35,194 @@ def slugify(name: str) -> str:
     s = s[:40]
     return s + "-" + secrets.token_hex(2)
 
+# ----------------------- DB yardımcıları -----------------------
+
+def is_postgres(engine) -> bool:
+    return engine.dialect.name in ("postgresql", "postgres")
+
+def current_ts_sql(engine) -> str:
+    # tablo default'u için epoch (saniye)
+    return "EXTRACT(EPOCH FROM NOW())" if is_postgres(engine) else "strftime('%s','now')"
+
+def create_schema(engine):
+    """
+    SQLite ve PostgreSQL için uyumlu şema yaratır (id, timestamp default'ları dahil).
+    """
+    ts_default = current_ts_sql(engine)
+
+    if is_postgres(engine):
+        ddl = [
+            f"""
+            CREATE TABLE IF NOT EXISTS users(
+              id SERIAL PRIMARY KEY,
+              linkedin_id TEXT UNIQUE,
+              name TEXT,
+              avatar_url TEXT,
+              edu_email TEXT,
+              edu_verified_at DOUBLE PRECISION,
+              created_at DOUBLE PRECISION DEFAULT ({ts_default})
+            );
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS clubs(
+              id SERIAL PRIMARY KEY,
+              name TEXT NOT NULL,
+              slug TEXT UNIQUE,
+              owner_user_id INTEGER NOT NULL,
+              created_at DOUBLE PRECISION DEFAULT ({ts_default})
+            );
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS club_members(
+              club_id INTEGER NOT NULL,
+              user_id INTEGER NOT NULL,
+              role TEXT NOT NULL DEFAULT 'member',
+              joined_at DOUBLE PRECISION DEFAULT ({ts_default}),
+              PRIMARY KEY (club_id, user_id)
+            );
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS events(
+              id SERIAL PRIMARY KEY,
+              club_id INTEGER NOT NULL,
+              title TEXT NOT NULL,
+              starts_at DOUBLE PRECISION,
+              ends_at DOUBLE PRECISION,
+              qr_secret TEXT NOT NULL,
+              created_by INTEGER NOT NULL,
+              created_at DOUBLE PRECISION DEFAULT ({ts_default})
+            );
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS checkins(
+              event_id INTEGER NOT NULL,
+              user_id INTEGER NOT NULL,
+              checked_at DOUBLE PRECISION DEFAULT ({ts_default}),
+              via_qr_secret TEXT,
+              PRIMARY KEY (event_id, user_id)
+            );
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS graph_edges(
+              id SERIAL PRIMARY KEY,
+              club_id INTEGER NOT NULL,
+              src_user_id INTEGER NOT NULL,
+              dst_user_id INTEGER NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending',
+              created_at DOUBLE PRECISION DEFAULT ({ts_default}),
+              UNIQUE (club_id, src_user_id, dst_user_id)
+            );
+            """
+        ]
+    else:
+        # SQLite
+        ddl = [
+            f"""
+            CREATE TABLE IF NOT EXISTS users(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              linkedin_id TEXT UNIQUE,
+              name TEXT,
+              avatar_url TEXT,
+              edu_email TEXT,
+              edu_verified_at REAL,
+              created_at REAL DEFAULT ({ts_default})
+            );
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS clubs(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT NOT NULL,
+              slug TEXT UNIQUE,
+              owner_user_id INTEGER NOT NULL,
+              created_at REAL DEFAULT ({ts_default})
+            );
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS club_members(
+              club_id INTEGER NOT NULL,
+              user_id INTEGER NOT NULL,
+              role TEXT NOT NULL DEFAULT 'member',
+              joined_at REAL DEFAULT ({ts_default}),
+              PRIMARY KEY (club_id, user_id)
+            );
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS events(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              club_id INTEGER NOT NULL,
+              title TEXT NOT NULL,
+              starts_at REAL,
+              ends_at REAL,
+              qr_secret TEXT NOT NULL,
+              created_by INTEGER NOT NULL,
+              created_at REAL DEFAULT ({ts_default})
+            );
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS checkins(
+              event_id INTEGER NOT NULL,
+              user_id INTEGER NOT NULL,
+              checked_at REAL DEFAULT ({ts_default}),
+              via_qr_secret TEXT,
+              PRIMARY KEY (event_id, user_id)
+            );
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS graph_edges(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              club_id INTEGER NOT NULL,
+              src_user_id INTEGER NOT NULL,
+              dst_user_id INTEGER NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending',
+              created_at REAL DEFAULT ({ts_default}),
+              UNIQUE (club_id, src_user_id, dst_user_id)
+            );
+            """
+        ]
+
+    with engine.begin() as con:
+        for sql in ddl:
+            con.exec_driver_sql(sql)
+
+def insert_with_returning(con, engine, sql_sqlite, sql_pg, params):
+    """
+    ID döndüren insert: SQLite'ta lastrowid, PostgreSQL'de RETURNING.
+    """
+    if is_postgres(engine):
+        res = con.execute(text(sql_pg), params)
+        row = res.fetchone()
+        return row[0] if row else None
+    else:
+        res = con.execute(text(sql_sqlite), params)
+        return res.lastrowid
+
+def insert_ignore_or_conflict(con, engine, table, columns, values_map, conflict_cols=None, update_map=None):
+    """
+    SQLite: INSERT OR IGNORE / REPLACE
+    Postgres: INSERT ... ON CONFLICT DO NOTHING/UPDATE
+    """
+    cols = ", ".join(columns)
+    placeholders = ", ".join([f":{k}" for k in values_map.keys()])
+
+    if is_postgres(engine):
+        if update_map is None:
+            # DO NOTHING
+            sql = f"INSERT INTO {table} ({cols}) VALUES ({placeholders}) ON CONFLICT ({', '.join(conflict_cols)}) DO NOTHING"
+        else:
+            set_clause = ", ".join([f"{k}=EXCLUDED.{k}" for k in update_map.keys()])
+            sql = f"INSERT INTO {table} ({cols}) VALUES ({placeholders}) ON CONFLICT ({', '.join(conflict_cols)}) DO UPDATE SET {set_clause}"
+        con.execute(text(sql), values_map)
+    else:
+        # SQLite tarafı: update_map varsa REPLACE, yoksa IGNORE kullanalım
+        if update_map is None:
+            sql = f"INSERT OR IGNORE INTO {table} ({cols}) VALUES ({placeholders})"
+        else:
+            # REPLACE mevcut satırı silip ekler; burada role/joined_at güncellensin istiyorsak REPLACE iş görür
+            sql = f"INSERT OR REPLACE INTO {table} ({cols}) VALUES ({placeholders})"
+        con.execute(text(sql), values_map)
+
+# --------------------------------------------------------------
+
 def create_app():
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret-key")
@@ -44,69 +232,17 @@ def create_app():
 
     # --- DB ---
     DB_URL = os.getenv("DATABASE_URL", "sqlite:///enfekte.db")
-    engine = create_engine(DB_URL, echo=False, future=True)
-    with engine.begin() as con:
-        con.exec_driver_sql("""
-        CREATE TABLE IF NOT EXISTS users(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          linkedin_id TEXT UNIQUE,
-          name TEXT,
-          avatar_url TEXT,
-          edu_email TEXT,
-          edu_verified_at REAL,
-          created_at REAL DEFAULT (strftime('%s','now'))
-        );
-        """)
-        con.exec_driver_sql("""
-        CREATE TABLE IF NOT EXISTS clubs(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          name TEXT NOT NULL,
-          slug TEXT UNIQUE,
-          owner_user_id INTEGER NOT NULL,
-          created_at REAL DEFAULT (strftime('%s','now'))
-        );
-        """)
-        con.exec_driver_sql("""
-        CREATE TABLE IF NOT EXISTS club_members(
-          club_id INTEGER NOT NULL,
-          user_id INTEGER NOT NULL,
-          role TEXT NOT NULL DEFAULT 'member',
-          joined_at REAL DEFAULT (strftime('%s','now')),
-          PRIMARY KEY (club_id, user_id)
-        );
-        """)
-        con.exec_driver_sql("""
-        CREATE TABLE IF NOT EXISTS events(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          club_id INTEGER NOT NULL,
-          title TEXT NOT NULL,
-          starts_at REAL,
-          ends_at REAL,
-          qr_secret TEXT NOT NULL,
-          created_by INTEGER NOT NULL,
-          created_at REAL DEFAULT (strftime('%s','now'))
-        );
-        """)
-        con.exec_driver_sql("""
-        CREATE TABLE IF NOT EXISTS checkins(
-          event_id INTEGER NOT NULL,
-          user_id INTEGER NOT NULL,
-          checked_at REAL DEFAULT (strftime('%s','now')),
-          via_qr_secret TEXT,
-          PRIMARY KEY (event_id, user_id)
-        );
-        """)
-        con.exec_driver_sql("""
-        CREATE TABLE IF NOT EXISTS graph_edges(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          club_id INTEGER NOT NULL,
-          src_user_id INTEGER NOT NULL,
-          dst_user_id INTEGER NOT NULL,
-          status TEXT NOT NULL DEFAULT 'pending',
-          created_at REAL DEFAULT (strftime('%s','now')),
-          UNIQUE (club_id, src_user_id, dst_user_id)
-        );
-        """)
+    engine = create_engine(
+        DB_URL,
+        echo=False,
+        future=True,
+        pool_pre_ping=True,
+        pool_size=5,
+        max_overflow=5
+    )
+
+    # Şema oluştur (her iki veritabanı için)
+    create_schema(engine)
 
     serializer = URLSafeTimedSerializer(app.config["SECRET_KEY"])
 
@@ -130,10 +266,14 @@ def create_app():
               SELECT role FROM club_members WHERE club_id=:c AND user_id=:u
             """), {"c": club_id, "u": user_id}).first()
             if not row:
-                con.execute(text("""
-                  INSERT INTO club_members (club_id, user_id, role, joined_at)
-                  VALUES (:c,:u,:r,:t)
-                """), {"c": club_id, "u": user_id, "r": role_default, "t": now_ts()})
+                insert_ignore_or_conflict(
+                    con, engine,
+                    table="club_members",
+                    columns=["club_id","user_id","role","joined_at"],
+                    values_map={"club_id": club_id, "user_id": user_id, "role": role_default, "joined_at": now_ts()},
+                    conflict_cols=["club_id","user_id"],
+                    update_map=None  # DO NOTHING/IGNORE
+                )
 
     def is_admin_or_owner(club_id: int, user_id: int) -> bool:
         with engine.begin() as con:
@@ -208,7 +348,7 @@ def create_app():
         session.clear()
         return redirect(url_for("index"))
 
-    # ---------- LinkedIn OAuth2 (manuel / OIDC benzeri) ----------
+    # ---------- LinkedIn OAuth2 ----------
     @app.get("/auth/linkedin/login")
     def li_login():
         nxt = request.args.get("next")
@@ -324,7 +464,7 @@ def create_app():
                         pass
             if not email:
                 mail = requests.get(
-                    "https://api.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))",
+                    "https://www.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))",
                     headers=headers, timeout=15, verify=REQUESTS_VERIFY
                 )
                 if mail.status_code == 200:
@@ -349,10 +489,28 @@ def create_app():
                 con.execute(text("UPDATE users SET name=:n, avatar_url=:a WHERE id=:id"),
                             {"n": name, "a": avatar, "id": uid})
             else:
-                res = con.execute(text(
-                    "INSERT INTO users (linkedin_id, name, avatar_url, edu_email) VALUES (:lid,:n,:a,:e)"
-                ), {"lid": sub, "n": name, "a": avatar, "e": email})
-                uid = res.lastrowid
+                if is_postgres(engine):
+                    uid = insert_with_returning(
+                        con, engine,
+                        # sqlite eşleniği (RETURNING yok, lastrowid alacağız ama burada zaten pg branch’indeyiz)
+                        sql_sqlite="",
+                        sql_pg="""
+                          INSERT INTO users (linkedin_id, name, avatar_url, edu_email)
+                          VALUES (:lid, :n, :a, :e)
+                          RETURNING id
+                        """,
+                        params={"lid": sub, "n": name, "a": avatar, "e": email}
+                    )
+                else:
+                    uid = insert_with_returning(
+                        con, engine,
+                        sql_sqlite="""
+                          INSERT INTO users (linkedin_id, name, avatar_url, edu_email)
+                          VALUES (:lid, :n, :a, :e)
+                        """,
+                        sql_pg="",
+                        params={"lid": sub, "n": name, "a": avatar, "e": email}
+                    )
 
         session["uid"] = uid
         flash("Giriş başarılı.", "success")
@@ -383,7 +541,8 @@ def create_app():
         if not allowed_edu(edu_email):
             flash("Bu alan izinli değil. İzinli alanlar: " + os.getenv("EDU_ALLOWED_DOMAINS",""), "danger")
             return redirect(url_for("verify"))
-        token = serializer.dumps({"uid": user["id"], "email": edu_email})
+        serializer_local = URLSafeTimedSerializer(app.config["SECRET_KEY"])
+        token = serializer_local.dumps({"uid": user["id"], "email": edu_email})
         link = app.config["HOST_URL"].rstrip("/") + url_for("verify_confirm") + "?" + urlencode({"token": token})
         html = f"""
         <p>Merhaba {user['name']},</p>
@@ -437,15 +596,36 @@ def create_app():
             return redirect(url_for("club_new"))
         s = slugify(name)
         with engine.begin() as con:
-            res = con.execute(text("""
-              INSERT INTO clubs (name, slug, owner_user_id, created_at)
-              VALUES (:n,:s,:o,:t)
-            """), {"n": name, "s": s, "o": user["id"], "t": now_ts()})
-            club_id = res.lastrowid
-            con.execute(text("""
-              INSERT OR REPLACE INTO club_members(club_id, user_id, role, joined_at)
-              VALUES (:c,:u,'owner',:t)
-            """), {"c": club_id, "u": user["id"], "t": now_ts()})
+            if is_postgres(engine):
+                club_id = insert_with_returning(
+                    con, engine,
+                    sql_sqlite="",
+                    sql_pg="""
+                      INSERT INTO clubs (name, slug, owner_user_id, created_at)
+                      VALUES (:n,:s,:o,:t)
+                      RETURNING id
+                    """,
+                    params={"n": name, "s": s, "o": user["id"], "t": now_ts()}
+                )
+            else:
+                club_id = insert_with_returning(
+                    con, engine,
+                    sql_sqlite="""
+                      INSERT INTO clubs (name, slug, owner_user_id, created_at)
+                      VALUES (:n,:s,:o,:t)
+                    """,
+                    sql_pg="",
+                    params={"n": name, "s": s, "o": user["id"], "t": now_ts()}
+                )
+            # owner kaydı
+            insert_ignore_or_conflict(
+                con, engine,
+                table="club_members",
+                columns=["club_id","user_id","role","joined_at"],
+                values_map={"club_id": club_id, "user_id": user["id"], "role": "owner", "joined_at": now_ts()},
+                conflict_cols=["club_id","user_id"],
+                update_map={"role": "owner", "joined_at": now_ts()}
+            )
         flash("Kulüp oluşturuldu.", "success")
         return redirect(url_for("club_detail", club_id=club_id))
 
@@ -511,11 +691,27 @@ def create_app():
         ends_at   = parse_dt(ends)
         qr_secret = secrets.token_urlsafe(16)
         with engine.begin() as con:
-            res = con.execute(text("""
-              INSERT INTO events (club_id, title, starts_at, ends_at, qr_secret, created_by, created_at)
-              VALUES (:c,:t,:s,:e,:q,:u,:now)
-            """), {"c": club_id, "t": title, "s": starts_at, "e": ends_at, "q": qr_secret, "u": user["id"], "now": now_ts()})
-            event_id = res.lastrowid
+            if is_postgres(engine):
+                event_id = insert_with_returning(
+                    con, engine,
+                    sql_sqlite="",
+                    sql_pg="""
+                      INSERT INTO events (club_id, title, starts_at, ends_at, qr_secret, created_by, created_at)
+                      VALUES (:c,:t,:s,:e,:q,:u,:now)
+                      RETURNING id
+                    """,
+                    params={"c": club_id, "t": title, "s": starts_at, "e": ends_at, "q": qr_secret, "u": user["id"], "now": now_ts()}
+                )
+            else:
+                event_id = insert_with_returning(
+                    con, engine,
+                    sql_sqlite="""
+                      INSERT INTO events (club_id, title, starts_at, ends_at, qr_secret, created_by, created_at)
+                      VALUES (:c,:t,:s,:e,:q,:u,:now)
+                    """,
+                    sql_pg="",
+                    params={"c": club_id, "t": title, "s": starts_at, "e": ends_at, "q": qr_secret, "u": user["id"], "now": now_ts()}
+                )
         flash("Etkinlik oluşturuldu.", "success")
         return redirect(url_for("event_live", event_id=event_id))
 
@@ -568,10 +764,14 @@ def create_app():
                 flash("Geçersiz QR.", "danger")
                 return redirect(url_for("index"))
             ensure_member(ev["club_id"], user["id"])
-            con.execute(text("""
-              INSERT OR IGNORE INTO checkins(event_id, user_id, checked_at, via_qr_secret)
-              VALUES (:e,:u,:t,:q)
-            """), {"e": e, "u": user["id"], "t": now_ts(), "q": q})
+            insert_ignore_or_conflict(
+                con, engine,
+                table="checkins",
+                columns=["event_id","user_id","checked_at","via_qr_secret"],
+                values_map={"event_id": e, "user_id": user["id"], "checked_at": now_ts(), "via_qr_secret": q},
+                conflict_cols=["event_id","user_id"],
+                update_map=None  # DO NOTHING/IGNORE
+            )
         flash("Yoklamaya eklendin. Hoş geldin! 👋", "success")
         return redirect(url_for("club_detail", club_id=ev["club_id"]))
 
@@ -594,10 +794,17 @@ def create_app():
             if ex:
                 flash(f"Zaten durum: {ex['status']}.", "info")
             else:
-                con.execute(text("""
-                  INSERT INTO graph_edges (club_id, src_user_id, dst_user_id, status, created_at)
-                  VALUES (:c,:a,:b,'pending',:t)
-                """), {"c": club_id, "a": user["id"], "b": target_id, "t": now_ts()})
+                if is_postgres(engine):
+                    con.execute(text("""
+                      INSERT INTO graph_edges (club_id, src_user_id, dst_user_id, status, created_at)
+                      VALUES (:c,:a,:b,'pending',:t)
+                      ON CONFLICT (club_id, src_user_id, dst_user_id) DO NOTHING
+                    """), {"c": club_id, "a": user["id"], "b": target_id, "t": now_ts()})
+                else:
+                    con.execute(text("""
+                      INSERT OR IGNORE INTO graph_edges (club_id, src_user_id, dst_user_id, status, created_at)
+                      VALUES (:c,:a,:b,'pending',:t)
+                    """), {"c": club_id, "a": user["id"], "b": target_id, "t": now_ts()})
                 flash("Bağ isteği gönderildi.", "success")
         return redirect(url_for("club_detail", club_id=club_id))
 
@@ -702,7 +909,6 @@ def create_app():
                 if e["tkey"] and cur_key and e["tkey"] > cur_key:
                     next_id = e["id"]; break
             if not next_id and len(events_all) >= 2:
-                # son çare: listedeki kendinden sonraki (varsa)
                 ids = [x["id"] for x in events_all]
                 try:
                     idx = ids.index(ev["id"])
@@ -827,7 +1033,6 @@ def create_app():
             avg_retention = (sum(p["rate"] for p in retention_pairs) / len(retention_pairs)) if retention_pairs else 0.0
 
             # Heatmap için satırlar = kullanıcılar (en az 1 kez katılan)
-            # İsimleri çekelim
             active_user_ids = set()
             for s in attendees_by_event.values():
                 active_user_ids |= s
@@ -837,7 +1042,6 @@ def create_app():
                 uq = text(f"SELECT id, name, avatar_url FROM users WHERE id IN ({placeholders})")
                 for r in con.execute(uq).all():
                     users_meta[r[0]] = {"id": r[0], "name": r[1], "avatar_url": r[2]}
-            # Heatmap matrisi: satır bazlı
             heatmap_rows = []
             for uid in sorted(list(active_user_ids)):
                 row = {
@@ -850,7 +1054,7 @@ def create_app():
                     row["attends"].append(1 if uid in attendees_by_event.get(e["id"], set()) else 0)
                 heatmap_rows.append(row)
 
-            # En aktif katılımcılar (çok check-in)
+            # En aktif katılımcılar
             active_counts = []
             for uid in active_user_ids:
                 cnt = sum(1 for ev_id in event_ids if uid in attendees_by_event.get(ev_id, set()))
@@ -861,7 +1065,7 @@ def create_app():
                 meta = users_meta.get(uid, {"name": f"User {uid}"})
                 top_participants.append({"user_id": uid, "name": meta.get("name"), "avatar_url": meta.get("avatar_url"), "count": cnt})
 
-            # En çok bağlantı (degree) — accepted edges'e göre
+            # En çok bağlantı (degree)
             degrees = {}
             edges = con.execute(text("""
                 SELECT src_user_id, dst_user_id FROM graph_edges 
@@ -875,7 +1079,6 @@ def create_app():
             for uid, deg in degree_sorted[:5]:
                 meta = users_meta.get(uid)
                 if not meta:
-                    # meta yoksa getir
                     m = con.execute(text("SELECT name, avatar_url FROM users WHERE id=:i"), {"i": uid}).first()
                     meta = {"name": m[0] if m else f"User {uid}", "avatar_url": m[1] if m else None}
                 top_connectors.append({"user_id": uid, "name": meta["name"], "avatar_url": meta["avatar_url"], "degree": deg})
