@@ -2,124 +2,225 @@
 {% block title %}Topluluk Ağı • enfekte.co{% endblock %}
 {% block content %}
   <h3 class="section-title">Topluluk Ağı</h3>
-  <p class="muted">Bağ oluşturmak için kulüp panelinden “Tanıyorum” gönder, gelen istekleri kabul et.</p>
+  <p class="muted">Bağ oluşturmak için kulüp panelinden “Tanıyorum” isteği gönder; karşı taraf kabul ettiğinde kenar oluşur.</p>
 
+  <!-- Kontroller -->
+  <div class="list" style="margin-bottom:12px; gap:10px; align-items:center; display:flex; flex-wrap:wrap">
+    <label class="kbd" style="display:flex; align-items:center; gap:8px">
+      <input id="togglePending" type="checkbox"> Bekleyen bağlantıları da göster
+    </label>
+    <div style="display:flex; align-items:center; gap:8px">
+      <span class="sub">Zaman:</span>
+      <input id="timeRange" type="range" min="0" max="{{ max_ts|int }}" value="{{ max_ts|int }}" />
+      <span class="sub" id="rangeNow">şimdi</span>
+    </div>
+    <div style="margin-left:auto; display:flex; gap:8px">
+      <input id="searchUser" type="text" placeholder="Üye ara…" style="padding:8px 10px; border-radius:8px; border:1px solid var(--glass-stroke); background:rgba(255,255,255,.06); color:#fff">
+      <button id="fit" class="btn-badge">Sığdır</button>
+      <button id="reset" class="btn-badge" style="opacity:.8">Sıfırla</button>
+    </div>
+  </div>
+
+  <!-- Grafik alanı -->
   <div id="graph" style="width:100%; height:550px; border:1px solid var(--glass-stroke); border-radius:8px; background:rgba(0,0,0,.08)"></div>
+
+  <!-- Mini istatistik -->
+  <div class="sub" style="margin-top:8px; display:flex; gap:16px; align-items:center; flex-wrap:wrap">
+    <span>N: <b id="statN">—</b></span>
+    <span>E: <b id="statE">—</b></span>
+    <span>Yoğunluk: <b id="statD">—</b></span>
+    <span style="display:inline-flex; gap:10px; align-items:center">
+      <span style="width:10px; height:10px; border-radius:50%; background:#4ea2ff; display:inline-block"></span> kabul
+      <span style="width:10px; height:10px; border-radius:50%; background:#9aa6bf; display:inline-block; margin-left:10px"></span> bekleyen
+      <span style="width:10px; height:10px; border-radius:50%; background:#ffd166; display:inline-block; margin-left:10px"></span> seçili
+    </span>
+  </div>
 
   <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
   <script>
     const wrap = document.getElementById('graph');
+    const pendingToggle = document.getElementById('togglePending');
+    const timeRange = document.getElementById('timeRange');
+    const searchInput = document.getElementById('searchUser');
+    const fitBtn = document.getElementById('fit');
+    const resetBtn = document.getElementById('reset');
+    const statN = document.getElementById('statN');
+    const statE = document.getElementById('statE');
+    const statD = document.getElementById('statD');
+
     let width = wrap.clientWidth, height = wrap.clientHeight;
 
     const svg = d3.select("#graph").append("svg")
       .attr("width", width).attr("height", height);
 
-    // zoom/pan için bir grup
-    const g = svg.append("g");
+    // zoom/pan container
+    const container = svg.append("g").attr("class","container");
 
-    // defs sadece bir kez
+    // layers
+    const linkLayer    = container.append("g").attr("stroke","#4ea2ff").attr("stroke-width",1.5).attr("stroke-opacity",0.9);
+    const pendingLayer = container.append("g").attr("stroke","#9aa6bf").attr("stroke-dasharray","4 4").attr("stroke-opacity",0.6);
+    const nodeLayer    = container.append("g");
+    const labelLayer   = container.append("g");
+
+    // defs for avatar patterns
     const defs = svg.append("defs");
-
     function ensureAvatarPattern(id, href){
-      // aynı id varsa tekrar ekleme
       if (document.getElementById(id)) return;
-      const pat = defs.append("pattern")
-        .attr("id", id)
-        .attr("width", 1).attr("height", 1)
-        .attr("patternContentUnits", "objectBoundingBox");
-      pat.append("image")
-        .attr("href", href)
-        .attr("preserveAspectRatio","xMidYMid slice")
-        .attr("width", 1).attr("height", 1);
+      const pat = defs.append("pattern").attr("id", id).attr("width", 1).attr("height", 1).attr("patternContentUnits","objectBoundingBox");
+      pat.append("image").attr("href", href).attr("preserveAspectRatio","xMidYMid slice").attr("width", 1).attr("height", 1);
     }
 
-    // zoom & pan
-    const zoom = d3.zoom()
-      .scaleExtent([0.5, 3])
-      .on("zoom", (event) => { g.attr("transform", event.transform); });
+    // zoom
+    const zoom = d3.zoom().scaleExtent([0.5, 3]).on("zoom", (event) => container.attr("transform", event.transform));
     svg.call(zoom);
 
-    // katmanlar
-    const linkLayer = g.append("g").attr("stroke","#ccc").attr("stroke-width",1.5);
-    const nodeLayer = g.append("g");
-    const labelLayer= g.append("g");
+    // simulation
+    const sim = d3.forceSimulation()
+      .force("link", d3.forceLink().id(d => d.id).distance(100))
+      .force("charge", d3.forceManyBody().strength(-200))
+      .force("center", d3.forceCenter(width/2, height/2));
 
-    fetch("{{ url_for('club_graph_json', club_id=club_id) }}")
-      .then(r => r.ok ? r.json() : Promise.reject(r.status))
-      .then(data => {
-        const nodes = data.nodes.map(d => ({...d}));
-        let links  = data.edges.map(e => ({...e}));
+    let nodes=[], edges=[], pEdges=[];
+    let selectedId = null;
 
-        // avatar pattern’ları
-        nodes.forEach(n => { if (n.avatar) ensureAvatarPattern("avatar-"+n.id, n.avatar); });
+    // fetch & render
+    function fetchAndRender(){
+      const includePending = pendingToggle.checked ? 1 : 0;
+      const until = timeRange.value;
+      const url = "{{ url_for('club_graph_json', club_id=club_id) }}" + `?until=${until}&include_pending=${includePending}`;
 
-        // source/target'ı node nesnelerine dönüştür
-        const byId = new Map(nodes.map(n => [n.id, n]));
-        links = links
-          .map(l => ({...l, source: byId.get(l.source), target: byId.get(l.target)}))
-          .filter(l => l.source && l.target); // eksik uçları ele
+      fetch(url)
+        .then(r => r.ok ? r.json() : Promise.reject(r.status))
+        .then(data => {
+          nodes = (data.nodes || []).map(d => ({...d}));
+          edges = (data.edges || []).map(e => ({...e}));
+          pEdges= (data.pending_edges || []).map(e => ({...e}));
 
-        // simülasyon
-        const sim = d3.forceSimulation(nodes)
-          .force("link", d3.forceLink(links).id(d => d.id).distance(120))
-          .force("charge", d3.forceManyBody().strength(-180))
-          .force("center", d3.forceCenter(width/2, height/2));
+          // avatar patterns
+          nodes.forEach(n => { if (n.avatar) ensureAvatarPattern("avatar-"+n.id, n.avatar); });
 
-        const link = linkLayer.selectAll("line")
-          .data(links)
-          .enter().append("line");
+          // map edges to objects
+          const byId = new Map(nodes.map(n => [n.id, n]));
+          const toObj = l => ({...l, source: byId.get(l.source), target: byId.get(l.target)});
+          const ok = l => l.source && l.target;
 
-        const node = nodeLayer.selectAll("g.node")
-          .data(nodes)
-          .enter().append("g").attr("class","node")
-          .call(d3.drag()
-            .on("start", (event,d)=>{ if(!event.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; })
-            .on("drag",  (event,d)=>{ d.fx=event.x; d.fy=event.y; })
-            .on("end",   (event,d)=>{ if(!event.active) sim.alphaTarget(0); d.fx=null; d.fy=null; })
-          );
+          const linksA = edges.map(toObj).filter(ok);
+          const linksP = pEdges.map(toObj).filter(ok);
 
-        node.append("title").text(d => d.label);
+          // JOINS
+          const linkSel = linkLayer.selectAll("line").data(linksA, d => d.source.id+"-"+d.target.id);
+          linkSel.exit().remove();
+          linkSel.enter().append("line").merge(linkSel)
+            .attr("data-state", d => (d.source.id===selectedId || d.target.id===selectedId) ? "selected" : null);
 
-        node.append("circle")
-          .attr("r", 18)
-          .attr("fill", d => d.avatar ? `url(#avatar-${d.id})` : "#89a")
-          .attr("stroke","#333").attr("stroke-width",0.5);
+          const pendSel = pendingLayer.selectAll("line").data(linksP, d => d.source.id+"-"+d.target.id);
+          pendSel.exit().remove();
+          pendSel.enter().append("line").merge(pendSel)
+            .attr("data-state", d => (d.source.id===selectedId || d.target.id===selectedId) ? "selected" : null);
 
-        const label = labelLayer.selectAll("text")
-          .data(nodes)
-          .enter().append("text")
-          .attr("font-size","12px")
-          .attr("paint-order","stroke")
-          .attr("stroke","#111").attr("stroke-width",2).attr("stroke-opacity",0.4)
-          .attr("fill","#eee")
-          .text(d => d.label);
+          const nodeSel = nodeLayer.selectAll("g.node").data(nodes, d => d.id);
+          nodeSel.exit().remove();
+          const nodeEnter = nodeSel.enter().append("g").attr("class","node")
+            .call(d3.drag()
+              .on("start", (event,d)=>{ if(!event.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; })
+              .on("drag",  (event,d)=>{ d.fx=event.x; d.fy=event.y; })
+              .on("end",   (event,d)=>{ if(!event.active) sim.alphaTarget(0); d.fx=null; d.fy=null; })
+            )
+            .on("click", (_,d)=> selectNode(d.id));
 
-        sim.on("tick", () => {
-          link
-            .attr("x1", d => d.source.x)
-            .attr("y1", d => d.source.y)
-            .attr("x2", d => d.target.x)
-            .attr("y2", d => d.target.y);
+          nodeEnter.append("title").text(d => d.label);
+          nodeEnter.append("circle")
+            .attr("r", 16)
+            .attr("fill", d => d.avatar ? `url(#avatar-${d.id})` : "#2f8dff")
+            .attr("stroke","#111").attr("stroke-width",1);
 
-          node.attr("transform", d => `translate(${d.x},${d.y})`);
-          label.attr("x", d => d.x + 22).attr("y", d => d.y + 4);
+          const nodeAll = nodeEnter.merge(nodeSel);
+          nodeAll.attr("data-state", d => selectedId && (d.id===selectedId) ? "selected" : null);
+
+          const labelSel = labelLayer.selectAll("text").data(nodes, d => d.id);
+          labelSel.exit().remove();
+          labelSel.enter().append("text")
+            .attr("font-size","12px").attr("paint-order","stroke")
+            .attr("stroke","#111").attr("stroke-width",2).attr("stroke-opacity",0.4)
+            .attr("fill","#eee")
+            .text(d => d.label)
+            .merge(labelSel);
+
+          sim.nodes(nodes).on("tick", ticked);
+          sim.force("link").links([...linksA, ...linksP]);
+          sim.alpha(0.8).restart();
+
+          updateStats();
+          paintSelection();
+        })
+        .catch(err => {
+          console.error("graph load error", err);
+          wrap.innerHTML = '<div class="empty list">Graf verisi yüklenemedi.</div>';
         });
+    }
 
-        // resize desteği
-        window.addEventListener('resize', () => {
-          width = wrap.clientWidth; height = wrap.clientHeight;
-          svg.attr("width", width).attr("height", height);
-          sim.force("center", d3.forceCenter(width/2, height/2));
-          sim.alpha(0.5).restart();
-        }, { passive: true });
-      })
-      .catch(err => {
-        console.error("graph load error", err);
-        const box = document.createElement('div');
-        box.className = 'empty list';
-        box.textContent = 'Graf verisi yüklenemedi.';
-        wrap.appendChild(box);
-      });
+    function ticked() {
+      linkLayer.selectAll("line").attr("x1", d=>d.source.x).attr("y1", d=>d.source.y).attr("x2", d=>d.target.x).attr("y2", d=>d.target.y);
+      pendingLayer.selectAll("line").attr("x1", d=>d.source.x).attr("y1", d=>d.source.y).attr("x2", d=>d.target.x).attr("y2", d=>d.target.y);
+      nodeLayer.selectAll("g.node").attr("transform", d => `translate(${d.x},${d.y})`);
+      labelLayer.selectAll("text").attr("x", d => d.x + 20).attr("y", d => d.y + 4);
+    }
+
+    // selection
+    function selectNode(id){
+      selectedId = (selectedId === id) ? null : id;
+      paintSelection();
+    }
+    function paintSelection(){
+      const isSel = d => selectedId && (d.source.id===selectedId || d.target.id===selectedId);
+      linkLayer.selectAll("line").attr("data-state", d => isSel(d) ? "selected" : null);
+      pendingLayer.selectAll("line").attr("data-state", d => isSel(d) ? "selected" : null);
+      nodeLayer.selectAll("g.node").attr("data-state", d => selectedId && (d.id===selectedId) ? "selected" : null);
+    }
+
+    // stats
+    function updateStats(){
+      const N = nodes.length, E = edges.length;
+      statN.textContent = N;
+      statE.textContent = E;
+      statD.textContent = (N>1 ? (2*E)/(N*(N-1)) : 0).toFixed(3);
+    }
+
+    // actions
+    function fit(){ svg.transition().duration(300).call(zoom.transform, d3.zoomIdentity); }
+    function reset(){
+      pendingToggle.checked = false;
+      timeRange.value = {{ max_ts|int }};
+      searchInput.value = '';
+      selectedId = null;
+      fetchAndRender();
+    }
+
+    // search
+    function doSearch(){
+      const q = (searchInput.value || '').trim().toLowerCase();
+      if(!q){ selectedId=null; paintSelection(); return; }
+      const found = nodes.find(n => (n.label||'').toLowerCase().includes(q));
+      if(found){
+        selectedId = found.id;
+        paintSelection();
+        const t = d3.zoomTransform(svg.node());
+        svg.transition().duration(300)
+           .call(zoom.transform, t.translate(width/2-found.x, height/2-found.y).scale(1.1));
+      }
+    }
+
+    // events
+    const debounce = (fn,ms)=>{ let t=null; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a),ms); } };
+    timeRange.addEventListener('input', debounce(fetchAndRender, 160));
+    pendingToggle.addEventListener('change', fetchAndRender);
+    window.addEventListener('resize', ()=>{ width = wrap.clientWidth; height = wrap.clientHeight; svg.attr("width", width).attr("height", height); sim.force("center", d3.forceCenter(width/2, height/2)); sim.alpha(0.2).restart(); }, { passive: true });
+    fitBtn.addEventListener('click', fit);
+    resetBtn.addEventListener('click', reset);
+    searchInput.addEventListener('keydown', e=>{ if(e.key==='Enter') doSearch(); });
+
+    // boot
+    fetchAndRender();
   </script>
 {% endblock %}
 
