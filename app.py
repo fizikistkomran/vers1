@@ -1,3 +1,5 @@
+# app.py — friendship graph (connect requests) entegre tam sürüm
+
 import os, io, csv, smtplib, ssl, json, time, traceback, secrets
 from email.message import EmailMessage
 from urllib.parse import urlencode, quote
@@ -9,7 +11,7 @@ from werkzeug.utils import secure_filename
 
 from flask import (
     Flask, render_template, render_template_string, redirect, url_for, session,
-    request, flash, send_file, abort, Response
+    request, flash, send_file, abort, Response, jsonify
 )
 from dotenv import load_dotenv
 from itsdangerous import URLSafeTimedSerializer
@@ -54,7 +56,7 @@ def current_ts_sql(engine) -> str:
 
 def create_schema(engine):
     """
-    Çekirdek tablolar + yeni banner/logo kolonları + görev/not tabloları.
+    Çekirdek tablolar + yeni banner/logo kolonları + görev/not tabloları + graph_edges.
     """
     ts_default = current_ts_sql(engine)
 
@@ -116,11 +118,12 @@ def create_schema(engine):
               club_id INTEGER NOT NULL,
               src_user_id INTEGER NOT NULL,
               dst_user_id INTEGER NOT NULL,
-              status TEXT NOT NULL DEFAULT 'accepted',
+              status TEXT NOT NULL DEFAULT 'accepted', -- pending|accepted|declined
+              requested_by INTEGER,                    -- isteği başlatan
+              responded_at DOUBLE PRECISION,           -- karar zamanı
               created_at DOUBLE PRECISION DEFAULT ({ts_default}),
               UNIQUE (club_id, src_user_id, dst_user_id)
             );""",
-            # Görevler / Notlar (ileride kullanmak üzere hazır)
             f"""
             CREATE TABLE IF NOT EXISTS club_tasks(
               id SERIAL PRIMARY KEY,
@@ -204,6 +207,8 @@ def create_schema(engine):
               src_user_id INTEGER NOT NULL,
               dst_user_id INTEGER NOT NULL,
               status TEXT NOT NULL DEFAULT 'accepted',
+              requested_by INTEGER,
+              responded_at REAL,
               created_at REAL DEFAULT ({ts_default}),
               UNIQUE (club_id, src_user_id, dst_user_id)
             );""",
@@ -243,13 +248,19 @@ def ensure_columns(engine):
     try:
         with engine.begin() as con:
             if is_postgres(engine):
+                # users / clubs / events mevcut eklemeler
                 con.exec_driver_sql("ALTER TABLE users  ADD COLUMN IF NOT EXISTS avatar_cached_at DOUBLE PRECISION")
                 con.exec_driver_sql("ALTER TABLE users  ADD COLUMN IF NOT EXISTS edu_email TEXT")
                 con.exec_driver_sql("ALTER TABLE clubs  ADD COLUMN IF NOT EXISTS banner_url TEXT")
                 con.exec_driver_sql("ALTER TABLE clubs  ADD COLUMN IF NOT EXISTS logo_url TEXT")
                 con.exec_driver_sql("ALTER TABLE events ADD COLUMN IF NOT EXISTS banner_url TEXT")
                 con.exec_driver_sql("ALTER TABLE events ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'event'")
+                # graph_edges yeni alanlar
+                con.exec_driver_sql("ALTER TABLE graph_edges ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'accepted'")
+                con.exec_driver_sql("ALTER TABLE graph_edges ADD COLUMN IF NOT EXISTS requested_by INTEGER")
+                con.exec_driver_sql("ALTER TABLE graph_edges ADD COLUMN IF NOT EXISTS responded_at DOUBLE PRECISION")
             else:
+                # sqlite pragma ile kontrol
                 def has_col(table, col):
                     rows = con.execute(text(f"PRAGMA table_info({table})")).fetchall()
                     names = [r[1] for r in rows]
@@ -263,9 +274,15 @@ def ensure_columns(engine):
                 if not has_col("clubs", "logo_url"):
                     con.exec_driver_sql("ALTER TABLE clubs ADD COLUMN logo_url TEXT")
                 if not has_col("events", "banner_url"):
-                    con.exec_driver_sql("ALTER TABLE events ADD COLUMN banner_url TEXT")
+                    con.exec_driver_sql("ALTER TABLE events ADD COLUMN banner_url REAL")
                 if not has_col("events", "category"):
                     con.exec_driver_sql("ALTER TABLE events ADD COLUMN category TEXT DEFAULT 'event'")
+                if not has_col("graph_edges", "status"):
+                    con.exec_driver_sql("ALTER TABLE graph_edges ADD COLUMN status TEXT DEFAULT 'accepted'")
+                if not has_col("graph_edges", "requested_by"):
+                    con.exec_driver_sql("ALTER TABLE graph_edges ADD COLUMN requested_by INTEGER")
+                if not has_col("graph_edges", "responded_at"):
+                    con.exec_driver_sql("ALTER TABLE graph_edges ADD COLUMN responded_at REAL")
     except Exception:
         if DEBUG_TRACE: traceback.print_exc()
 
@@ -343,6 +360,11 @@ def _file_to_local(file_storage, out_dir: str, filename_base: str) -> str:
     web_rel = out_path.split(os.path.join(BASE_DIR, "static"))[-1].replace("\\","/")
     return "/static" + web_rel
 
+# ----------------------- Graph helpers -----------------------
+def canonical_pair(a: int, b: int):
+    """Undirected edge için kanonik (src,dst) sıralaması"""
+    return (a, b) if a <= b else (b, a)
+
 # --------------------------------------------------------------
 def create_app():
     app = Flask(__name__, template_folder="templates", static_folder="static")
@@ -374,6 +396,7 @@ def create_app():
         pool_size=pool_size,
         max_overflow=max_overflow,
         pool_recycle=pool_recycle,
+        connect_args={"connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "10"))} if DB_URL.startswith("postgresql") else {},
     )
 
     # İlk bağlantıyı birkaç kez dene (soğuk uyanma)
@@ -461,6 +484,15 @@ def create_app():
         is_member = row is not None
         is_admin = bool(row and ((row[0] or "").lower() in ADMIN_LIKE_ROLES or (row[0] or "").lower() != "member"))
         return is_member, is_admin
+
+    def get_edge_status(club_id: int, a: int, b: int):
+        s, d = canonical_pair(a, b)
+        with engine.begin() as con:
+            row = con.execute(text("""
+              SELECT status, requested_by FROM graph_edges 
+              WHERE club_id=:c AND src_user_id=:s AND dst_user_id=:d
+            """), {"c": club_id, "s": s, "d": d}).mappings().first()
+        return (row["status"], row["requested_by"]) if row else (None, None)
 
     # ---------- Templating ----------
     app.jinja_env.filters["ts"] = ts2human
@@ -588,7 +620,58 @@ def create_app():
             """), {"c": club_id}).mappings().all()
 
         owner = is_admin_or_owner(club_id, user["id"])
-        # Fallback bannerli görünüm
+        # Fallback bannerli görünüm + üyelerde bağlan/kabul/iptal
+        connect_rows = []
+        for m in members:
+            if m["id"] == user["id"]:
+                btn = "<em>Ben</em>"
+            else:
+                status, requested_by = get_edge_status(club_id, user["id"], m["id"])
+                if status is None:
+                    btn = f"""
+                    <form method="post" action="{url_for('connect_request', club_id=club_id)}" style="display:inline">
+                      <input type="hidden" name="target_user_id" value="{m['id']}"/>
+                      <button class="btn-badge">Bağlan</button>
+                    </form>"""
+                elif status == "pending":
+                    if requested_by == user["id"]:
+                        btn = f"""
+                        <form method="post" action="{url_for('connect_cancel', club_id=club_id)}" style="display:inline">
+                          <input type="hidden" name="target_user_id" value="{m['id']}"/>
+                          <button class="btn-badge" style="opacity:.8">İsteği İptal Et</button>
+                        </form>"""
+                    else:
+                        # gelen isteği kabul/ret
+                        s, d = canonical_pair(user["id"], m["id"])
+                        btn = f"""
+                        <form method="post" action="{url_for('connect_respond', club_id=club_id)}" style="display:inline;margin-right:6px">
+                          <input type="hidden" name="src_user_id" value="{s}"/>
+                          <input type="hidden" name="dst_user_id" value="{d}"/>
+                          <input type="hidden" name="action" value="accept"/>
+                          <button class="btn-badge">Kabul</button>
+                        </form>
+                        <form method="post" action="{url_for('connect_respond', club_id=club_id)}" style="display:inline">
+                          <input type="hidden" name="src_user_id" value="{s}"/>
+                          <input type="hidden" name="dst_user_id" value="{d}"/>
+                          <input type="hidden" name="action" value="decline"/>
+                          <button class="btn-badge" style="opacity:.7">Reddet</button>
+                        </form>
+                        """
+                elif status == "accepted":
+                    btn = "<span class='chip'>Bağlı</span>"
+                else:
+                    btn = "<span class='chip' style='opacity:.7'>Reddedildi</span>"
+            connect_rows.append(f"""
+              <tr>
+                <td style='display:flex;gap:8px;align-items:center'>
+                  <img src='{m.get('avatar_url') or '/static/avatar-placeholder.png'}' style='width:28px;height:28px;border-radius:50%;object-fit:cover' />
+                  {m['name']}
+                </td>
+                <td><code>{m['role']}</code></td>
+                <td>{btn}</td>
+              </tr>
+            """)
+
         fallback = f"""
         <div style="position:relative;border-radius:16px;overflow:hidden;border:1px solid #222">
           <div style="height:180px;background:#222 url('{club.get('banner_url') or ''}') center/cover no-repeat"></div>
@@ -602,6 +685,11 @@ def create_app():
           <a href="{url_for('club_graph', club_id=club_id)}">Grafik (beta)</a>
           <a href="{url_for('club_analytics', club_id=club_id)}">Analitik</a>
         </div>
+        <h3 style="margin-top:18px">Üyeler</h3>
+        <table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse">
+          <tr><th>Üye</th><th>Rol</th><th>Bağlantı</th></tr>
+          {''.join(connect_rows)}
+        </table>
         """
         return try_render("club_dashboard.html", user=user, club=club, members=members,
                           meetings=meetings, events=events, owner=owner,
@@ -626,11 +714,46 @@ def create_app():
             """), {"c": club_id}).mappings().all()
 
         roles = sorted({"member"} | ADMIN_LIKE_ROLES - {"owner"})  # owner ataması buradan yapılmaz
-        options = "".join([f"<option value='{r}'>{{{{ 'selected' if m.role=='{r}' else '' }}}}{r}</option>" for r in roles])
 
-        # Fallback form
+        # Fallback form + bağlanma butonları
         rows = []
         for m in members:
+            connect_part = ""
+            if m["id"] != user["id"]:
+                status, requested_by = get_edge_status(club_id, user["id"], m["id"])
+                if status is None:
+                    connect_part = f"""
+                    <form method="POST" action="{url_for('connect_request', club_id=club_id)}" style="display:inline">
+                      <input type="hidden" name="target_user_id" value="{m['id']}"/>
+                      <button>Bağlan</button>
+                    </form>"""
+                elif status == "pending":
+                    if requested_by == user["id"]:
+                        connect_part = f"""
+                        <form method="POST" action="{url_for('connect_cancel', club_id=club_id)}" style="display:inline">
+                          <input type="hidden" name="target_user_id" value="{m['id']}"/>
+                          <button>İptal</button>
+                        </form>"""
+                    else:
+                        s,d = canonical_pair(user["id"], m["id"])
+                        connect_part = f"""
+                        <form method="POST" action="{url_for('connect_respond', club_id=club_id)}" style="display:inline">
+                          <input type="hidden" name="src_user_id" value="{s}"/>
+                          <input type="hidden" name="dst_user_id" value="{d}"/>
+                          <input type="hidden" name="action" value="accept"/>
+                          <button>Kabul</button>
+                        </form>
+                        <form method="POST" action="{url_for('connect_respond', club_id=club_id)}" style="display:inline">
+                          <input type="hidden" name="src_user_id" value="{s}"/>
+                          <input type="hidden" name="dst_user_id" value="{d}"/>
+                          <input type="hidden" name="action" value="decline"/>
+                          <button>Reddet</button>
+                        </form>"""
+                elif status == "accepted":
+                    connect_part = "<span class='chip'>Bağlı</span>"
+                else:
+                    connect_part = "<span class='chip' style='opacity:.7'>Reddedildi</span>"
+
             rows.append(f"""
             <tr>
               <td style='display:flex;gap:8px;align-items:center'>
@@ -639,13 +762,14 @@ def create_app():
               </td>
               <td><code>{m['role']}</code></td>
               <td>
-                <form method="POST" action="{url_for('club_set_role', club_id=club_id)}">
+                <form method="POST" action="{url_for('club_set_role', club_id=club_id)}" style="display:inline;margin-right:12px">
                   <input type="hidden" name="user_id" value="{m['id']}"/>
                   <select name="role">
                     {''.join([f"<option value='{r}' {'selected' if m['role']==r else ''}>{r}</option>" for r in roles])}
                   </select>
                   <button>Kaydet</button>
                 </form>
+                {connect_part}
               </td>
             </tr>
             """)
@@ -653,7 +777,7 @@ def create_app():
         table = f"""
         <h2>Üyeler & Roller</h2>
         <table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse">
-          <tr><th>Üye</th><th>Mevcut Rol</th><th>Rol Ata</th></tr>
+          <tr><th>Üye</th><th>Mevcut Rol</th><th>İşlemler</th></tr>
           {''.join(rows)}
         </table>
         <p style='opacity:.7'>Not: <code>owner</code> değişikliği bu ekrandan yapılmaz.</p>
@@ -690,6 +814,142 @@ def create_app():
                 """), {"c": club_id, "u": target_uid, "r": new_role, "t": now_ts()})
         flash("Rol güncellendi.", "success")
         return redirect(url_for("club_members", club_id=club_id))
+
+    # ===================== FRIENDSHIP / CONNECTIONS =====================
+
+    @app.post("/clubs/<int:club_id>/connect/request")
+    def connect_request(club_id):
+        user = current_user()
+        if not user: return abort(401)
+        target = request.form.get("target_user_id", type=int)
+        if not target: return abort(400)
+        if target == user["id"]:
+            flash("Kendinle bağlantı kuramazsın.", "warning")
+            return redirect(url_for("club_dashboard", club_id=club_id))
+
+        # ikisi de kulüp üyesi mi?
+        with engine.begin() as con:
+            mine = con.execute(text("SELECT 1 FROM club_members WHERE club_id=:c AND user_id=:u"),
+                               {"c": club_id, "u": user["id"]}).first()
+            other = con.execute(text("SELECT 1 FROM club_members WHERE club_id=:c AND user_id=:u"),
+                                {"c": club_id, "u": target}).first()
+            if not (mine and other):
+                flash("Her iki tarafın da kulüp üyesi olması gerekir.", "danger")
+                return redirect(url_for("club_dashboard", club_id=club_id))
+
+            s,d = canonical_pair(user["id"], target)
+            row = con.execute(text("""
+              SELECT status, requested_by FROM graph_edges
+              WHERE club_id=:c AND src_user_id=:s AND dst_user_id=:d
+            """), {"c": club_id, "s": s, "d": d}).mappings().first()
+
+            ts = now_ts()
+            if row is None:
+                con.execute(text("""
+                  INSERT INTO graph_edges (club_id, src_user_id, dst_user_id, status, requested_by, created_at)
+                  VALUES (:c,:s,:d,'pending',:rq,:t)
+                """), {"c": club_id, "s": s, "d": d, "rq": user["id"], "t": ts})
+                flash("Bağlantı isteği gönderildi.", "success")
+            else:
+                st = (row["status"] or "").lower()
+                if st == "accepted":
+                    flash("Zaten bağlısınız.", "info")
+                elif st == "pending":
+                    flash("Zaten bekleyen bir istek var.", "info")
+                elif st == "declined":
+                    # tekrar deneyebilir: pending'e çevir
+                    con.execute(text("""
+                      UPDATE graph_edges SET status='pending', requested_by=:rq, responded_at=NULL
+                      WHERE club_id=:c AND src_user_id=:s AND dst_user_id=:d
+                    """), {"rq": user["id"], "c": club_id, "s": s, "d": d})
+                    flash("Bağlantı isteği tekrar gönderildi.", "success")
+        return redirect(url_for("club_dashboard", club_id=club_id))
+
+    @app.post("/clubs/<int:club_id>/connect/cancel")
+    def connect_cancel(club_id):
+        user = current_user()
+        if not user: return abort(401)
+        target = request.form.get("target_user_id", type=int)
+        if not target: return abort(400)
+
+        s,d = canonical_pair(user["id"], target)
+        with engine.begin() as con:
+            row = con.execute(text("""
+              SELECT status, requested_by FROM graph_edges
+              WHERE club_id=:c AND src_user_id=:s AND dst_user_id=:d
+            """), {"c": club_id, "s": s, "d": d}).mappings().first()
+            if not row or (row["status"] != "pending") or (row["requested_by"] != user["id"]):
+                flash("İptal edilecek bekleyen bir isteğin yok.", "warning")
+            else:
+                con.execute(text("""
+                  DELETE FROM graph_edges
+                  WHERE club_id=:c AND src_user_id=:s AND dst_user_id=:d AND status='pending' AND requested_by=:rq
+                """), {"c": club_id, "s": s, "d": d, "rq": user["id"]})
+                flash("İstek iptal edildi.", "success")
+        return redirect(url_for("club_dashboard", club_id=club_id))
+
+    @app.post("/clubs/<int:club_id>/connect/respond")
+    def connect_respond(club_id):
+        user = current_user()
+        if not user: return abort(401)
+        s = request.form.get("src_user_id", type=int)
+        d = request.form.get("dst_user_id", type=int)
+        action = (request.form.get("action") or "").strip().lower()
+        if not (s and d and action in {"accept","decline"}):
+            return abort(400)
+
+        # current user ikilinin üyelerinden biri olmalı ve pending olmalı
+        if user["id"] not in (s, d):
+            return abort(403)
+        with engine.begin() as con:
+            row = con.execute(text("""
+              SELECT status, requested_by FROM graph_edges
+              WHERE club_id=:c AND src_user_id=:s AND dst_user_id=:d
+            """), {"c": club_id, "s": s, "d": d}).mappings().first()
+            if not row or row["status"] != "pending":
+                flash("Bekleyen bir istek bulunamadı.", "warning")
+                return redirect(url_for("club_dashboard", club_id=club_id))
+            # isteği yanıtlayan taraf, requested_by dışında olan kullanıcı olmalı
+            if row["requested_by"] == user["id"]:
+                flash("Kendi gönderdiğin isteği kabul/ret edemezsin.", "warning")
+                return redirect(url_for("club_dashboard", club_id=club_id))
+
+            new_status = "accepted" if action == "accept" else "declined"
+            con.execute(text("""
+              UPDATE graph_edges 
+              SET status=:st, responded_at=:t
+              WHERE club_id=:c AND src_user_id=:s AND dst_user_id=:d
+            """), {"st": new_status, "t": now_ts(), "c": club_id, "s": s, "d": d})
+        flash("Seçimin kaydedildi.", "success")
+        return redirect(url_for("club_dashboard", club_id=club_id))
+
+    @app.get("/clubs/<int:club_id>/connect/pending")
+    def connect_pending(club_id):
+        user = current_user()
+        if not user: return abort(401)
+        with engine.begin() as con:
+            rows = con.execute(text("""
+              SELECT * FROM graph_edges
+              WHERE club_id=:c AND status='pending' AND (:u IN (src_user_id, dst_user_id))
+            """), {"c": club_id, "u": user["id"]}).mappings().all()
+        incoming, outgoing = [], []
+        for r in rows:
+            if r["requested_by"] == user["id"]:
+                outgoing.append(dict(r))
+            else:
+                incoming.append(dict(r))
+        return jsonify({"incoming": incoming, "outgoing": outgoing})
+
+    @app.get("/clubs/<int:club_id>/connect/my")
+    def connect_my(club_id):
+        user = current_user()
+        if not user: return abort(401)
+        with engine.begin() as con:
+            rows = con.execute(text("""
+              SELECT * FROM graph_edges
+              WHERE club_id=:c AND status='accepted' AND (:u IN (src_user_id, dst_user_id))
+            """), {"c": club_id, "u": user["id"]}).mappings().all()
+        return jsonify({"accepted": [dict(r) for r in rows]})
 
     # ===================== ANALİZ SAYFALARI (yalnız admin-like) =====================
     def _event_analytics_impl(event_id):
@@ -800,35 +1060,32 @@ def create_app():
             member_count = con.execute(text("SELECT COUNT(*) FROM club_members WHERE club_id=:c"),
                                        {"c": club_id}).scalar() or 0
 
-            event_ids = [e["id"] for e in events]
-            attendees_by_event = {eid: set() for eid in event_ids}
-            if event_ids:
-                placeholders = ",".join([str(eid) for eid in event_ids])
-                q = text(f"SELECT event_id, user_id FROM checkins WHERE event_id IN ({placeholders})")
-                allcis = con.execute(q).all()
-                for ev_id, uid in allcis:
-                    attendees_by_event[ev_id].add(uid)
+            # graph kenarları (accepted)
+            edge_rows = con.execute(text("""
+              SELECT src_user_id, dst_user_id FROM graph_edges 
+              WHERE club_id=:c AND status='accepted'
+            """), {"c": club_id}).all()
 
         total_events = len(events)
         total_checkins = sum(e["checkin_count"] for e in events)
-        unique_attendees = len({uid for s in attendees_by_event.values() for uid in s})
-        repeaters = sum(1 for uid in {uid for s in attendees_by_event.values() for uid in s}
-                        if sum(1 for ev_id in event_ids if uid in attendees_by_event.get(ev_id, set())) >= 2)
+        # graph metrikleri
+        N = member_count
+        E = len(edge_rows)
+        density = (2*E / (N*(N-1))) if (N and N>1) else 0.0
 
         fallback = f"""
         <h2>{club['name']} · Analitik</h2>
         <div>Etkinlik sayısı: <b>{total_events}</b></div>
         <div>Toplam yoklama: <b>{total_checkins}</b></div>
-        <div>Tekil katılımcı: <b>{unique_attendees}</b></div>
-        <div>En az 2 etkinliğe katılan: <b>{repeaters}</b></div>
+        <div>Ağ yoğunluğu (accepted): <b>{density:.3f}</b> (E={E}, N={N})</div>
+        <p style='margin-top:8px'><a href="{url_for('club_graph', club_id=club_id)}">Arkadaşlık Grafiğini gör</a></p>
         """
         return try_render("club_analysis.html",
                           user=user, club=club, events=events,
                           member_count=member_count,
                           total_events=total_events,
                           total_checkins=total_checkins,
-                          unique_attendees=unique_attendees,
-                          repeaters=repeaters,
+                          graph_density=density,
                           page_title="Kulüp Analitiği", fallback_html=fallback)
 
     # ===================== GRAF (D3) + TIMELAPSE =====================
@@ -853,6 +1110,9 @@ def create_app():
         <title>{{ club.name }} · Ağ Haritası</title>
         <div style="padding:12px;font-family:system-ui;color:#eee;background:#111">
           <h2 style="margin:8px 0 12px">{{ club.name }} · Ağ Haritası (beta)</h2>
+          <div style="margin-bottom:8px; display:flex; gap:10px; align-items:center">
+            <label><input id="togglePending" type="checkbox"/> bekleyen istekleri de göster</label>
+          </div>
           <div id="graph" style="width:100%;height:520px;border:1px solid #222;border-radius:12px"></div>
           <div style="margin-top:8px">
             <input id="timeRange" type="range" min="0" max="{{ max_ts|int }}" value="{{ max_ts|int }}" style="width:100%" />
@@ -866,8 +1126,9 @@ def create_app():
         const clubId = {{ club_id }};
         const graphEl = document.getElementById('graph');
         const slider  = document.getElementById('timeRange');
+        const togglePending = document.getElementById('togglePending');
 
-        let svg, width, height, simulation, link, node, label;
+        let svg, width, height, simulation, link, node, label, pendingLink;
 
         function init(){
           width = graphEl.clientWidth;
@@ -875,7 +1136,8 @@ def create_app():
           svg = d3.select('#graph').append('svg')
             .attr('width', width).attr('height', height)
             .style('background','#111');
-          link = svg.append('g').attr('stroke','#555').attr('stroke-opacity',0.6).selectAll('line');
+          link = svg.append('g').attr('stroke','#6aa0ff').attr('stroke-opacity',0.9).selectAll('line');
+          pendingLink = svg.append('g').attr('stroke','#888').attr('stroke-opacity',0.4).attr('stroke-dasharray','4 4').selectAll('line');
           node = svg.append('g').attr('stroke','#fff').attr('stroke-width',1).selectAll('circle');
           label= svg.append('g').selectAll('text');
           simulation = d3.forceSimulation()
@@ -887,12 +1149,17 @@ def create_app():
 
         function fetchAndRender(){
           const until = slider.value;
-          fetch(`/clubs/${clubId}/graph.json?until=${until}`)
+          const includePending = togglePending.checked ? 1 : 0;
+          fetch(`/clubs/${clubId}/graph.json?until=${until}&include_pending=${includePending}`)
             .then(r=>r.json())
             .then(data=>{
               link = link.data(data.edges, d=>d.source+'-'+d.target);
               link.exit().remove();
               link = link.enter().append('line').merge(link);
+
+              pendingLink = pendingLink.data(data.pending_edges || [], d=>d.source+'-'+d.target);
+              pendingLink.exit().remove();
+              pendingLink = pendingLink.enter().append('line').merge(pendingLink);
 
               node = node.data(data.nodes, d=>d.id);
               node.exit().remove();
@@ -911,13 +1178,16 @@ def create_app():
                 .merge(label);
 
               simulation.nodes(data.nodes).on('tick', ticked);
-              simulation.force('link').links(data.edges);
+              const allLinks = [...data.edges, ...(data.pending_edges||[])];
+              simulation.force('link').links(allLinks);
               simulation.alpha(0.8).restart();
             });
         }
 
         function ticked(){
           link.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y)
+              .attr('x2', d=>d.target.x).attr('y2', d=>d.target.y);
+          pendingLink.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y)
               .attr('x2', d=>d.target.x).attr('y2', d=>d.target.y);
           node.attr('cx', d=>d.x).attr('cy', d=>d.y);
           label.attr('x', d=>d.x+12).attr('y', d=>d.y+4);
@@ -939,6 +1209,7 @@ def create_app():
         // basit debounce
         let t=null;
         slider.addEventListener('input', ()=>{ clearTimeout(t); t=setTimeout(fetchAndRender,180); });
+        togglePending.addEventListener('change', fetchAndRender);
         window.addEventListener('resize', ()=>{ d3.select('#graph svg').remove(); init(); });
         init();
         </script>
@@ -956,27 +1227,36 @@ def create_app():
         if not is_admin:
             return {"error": "forbidden"}, 403
         until = request.args.get("until", type=float)  # epoch
+        include_pending = request.args.get("include_pending", default=0, type=int)
+
         with engine.begin() as con:
             nodes_rows = con.execute(text("""
               SELECT u.id AS id, u.name AS label, u.avatar_url AS avatar
               FROM club_members m JOIN users u ON u.id=m.user_id
               WHERE m.club_id=:c
             """), {"c": club_id}).mappings().all()
+            params = {"c": club_id}
+            time_clause = " AND created_at <= :t" if until else ""
             if until:
-                edges_rows = con.execute(text("""
+                params["t"] = until
+            edges_rows = con.execute(text(f"""
+              SELECT src_user_id AS source, dst_user_id AS target
+              FROM graph_edges 
+              WHERE club_id=:c AND status='accepted' {time_clause}
+            """), params).mappings().all()
+
+            pending_rows = []
+            if include_pending:
+                pending_rows = con.execute(text(f"""
                   SELECT src_user_id AS source, dst_user_id AS target
                   FROM graph_edges 
-                  WHERE club_id=:c AND status='accepted' AND created_at <= :t
-                """), {"c": club_id, "t": until}).mappings().all()
-            else:
-                edges_rows = con.execute(text("""
-                  SELECT src_user_id AS source, dst_user_id AS target
-                  FROM graph_edges 
-                  WHERE club_id=:c AND status='accepted'
-                """), {"c": club_id}).mappings().all()
+                  WHERE club_id=:c AND status='pending' {time_clause}
+                """), params).mappings().all()
+
         nodes = [dict(r) for r in nodes_rows]
         edges = [dict(r) for r in edges_rows]
-        return {"nodes": nodes, "edges": edges}
+        pending_edges = [dict(r) for r in pending_rows] if include_pending else []
+        return {"nodes": nodes, "edges": edges, "pending_edges": pending_edges}
 
     # ===================== EVENT / BANNER / QR =====================
     def _parse_dt_local(dt_str):
@@ -1390,6 +1670,23 @@ def create_app():
     @app.context_processor
     def inject_globals():
         return {"HOST_URL": app.config["HOST_URL"]}
+
+    # ---------- Basit verify akışı (şablonların bağladığı) ----------
+    @app.get("/verify")
+    def verify():
+        user = current_user()
+        allowed = os.getenv("EDU_ALLOWED_DOMAINS","")
+        return try_render("verify.html", user=user, allowed=allowed, page_title="EDU Doğrulama",
+                          fallback_html=f"<h2>EDU Doğrulama</h2><p>İzinli alanlar: {allowed}</p>")
+
+    @app.post("/verify/start")
+    def verify_start():
+        # Demo: e-posta gönderimini maketliyoruz
+        email = (request.form.get("edu_email") or "").strip()
+        if not email:
+            flash("E-posta gerekli.", "danger"); return redirect(url_for("verify"))
+        flash("Doğrulama bağlantısı gönderildi (demo).", "success")
+        return redirect(url_for("home"))
 
     return app
 
