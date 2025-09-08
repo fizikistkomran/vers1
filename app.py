@@ -8,6 +8,8 @@ import certifi
 import qrcode
 from PIL import Image
 from werkzeug.utils import secure_filename
+from connect_routes import bp as connections_bp
+
 
 from flask import (
     Flask, render_template, render_template_string, redirect, url_for, session,
@@ -368,6 +370,7 @@ def canonical_pair(a: int, b: int):
 # --------------------------------------------------------------
 def create_app():
     app = Flask(__name__, template_folder="templates", static_folder="static")
+    app.register_blueprint(connections_bp)
     app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret-key")
     app.config["HOST_URL"]   = os.getenv("HOST_URL", "http://localhost:8000")
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
