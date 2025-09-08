@@ -8,7 +8,6 @@ import certifi
 import qrcode
 from PIL import Image
 from werkzeug.utils import secure_filename
-from connect_routes import bp as connections_bp
 
 
 from flask import (
@@ -370,12 +369,13 @@ def canonical_pair(a: int, b: int):
 # --------------------------------------------------------------
 def create_app():
     app = Flask(__name__, template_folder="templates", static_folder="static")
-    app.register_blueprint(connections_bp)
     app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret-key")
     app.config["HOST_URL"]   = os.getenv("HOST_URL", "http://localhost:8000")
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
     app.config["SESSION_COOKIE_SECURE"]   = False
     app.config["MAX_CONTENT_LENGTH"]      = 12 * 1024 * 1024  # 12MB
+    from connect_routes import bp as connections_bp
+    app.register_blueprint(connections_bp)
 
     # --- DB ---
     # URL'i normalize et (Railway/SQLAlchemy uyumu)
