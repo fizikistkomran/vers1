@@ -18,8 +18,7 @@
 
 {% if owner %}
   <h3 class="section-title">Topluluk Ağı</h3>
-  <p class="muted">Bağ oluşturmak için kulüp panelinden “Tanıyorum” gönder, gelen istekleri kabul et. Tam ekran için üstteki bağlantıyı kullan.</p>
-  <!-- Mevcut /clubs/<id>/graph sayfasını gömüyoruz -->
+  <p class="muted">Bağ oluşturmak için aşağıdaki listeden “Bağlan” de; karşı taraf kabul ederse grafikte kenar oluşur.</p>
   <iframe
     src="{{ url_for('club_graph', club_id=club.id) }}"
     style="width:100%;height:560px;border:1px solid var(--glass-stroke);border-radius:12px;background:#0e0f13"
@@ -35,7 +34,7 @@
     <tr>
       <th style="text-align:left;padding:8px 6px">Üye</th>
       <th style="text-align:left;padding:8px 6px">Rol</th>
-      <th style="text-align:left;padding:8px 6px">İşlem</th>
+      <th style="text-align:left;padding:8px 6px">Bağlantı</th>
     </tr>
   </thead>
   <tbody>
@@ -47,7 +46,38 @@
       </td>
       <td style="padding:8px 6px"><code>{{ m.role }}</code></td>
       <td style="padding:8px 6px">
-        {# Buraya mevcut “Bağlan / Kabul / Reddet” formlarını koyuyorsan koru; yoksa boş bırak. #}
+        {% if m.id == user.id %}
+          <em>Ben</em>
+        {% else %}
+          {# Durum göstergesi (server tarafı hesaplayıp m.edge_status ve m.requested_by ekleyebilir; yoksa sadece "Bağlan" görünür) #}
+          {% if m.edge_status == 'accepted' %}
+            <span class="chip">Bağlı</span>
+          {% elif m.edge_status == 'pending' and m.requested_by == user.id %}
+            <form method="post" action="{{ url_for('connect_cancel', club_id=club.id) }}" style="display:inline">
+              <input type="hidden" name="target_user_id" value="{{ m.id }}">
+              <button class="btn-badge" style="opacity:.85">İsteği İptal Et</button>
+            </form>
+          {% elif m.edge_status == 'pending' and m.requested_by != user.id %}
+            {# Karşıdan geleni kabul/ret #}
+            <form method="post" action="{{ url_for('connect_respond', club_id=club.id) }}" style="display:inline;margin-right:6px">
+              <input type="hidden" name="src_user_id" value="{{ [user.id, m.id]|min }}">
+              <input type="hidden" name="dst_user_id" value="{{ [user.id, m.id]|max }}">
+              <input type="hidden" name="action" value="accept">
+              <button class="btn-badge">Kabul</button>
+            </form>
+            <form method="post" action="{{ url_for('connect_respond', club_id=club.id) }}" style="display:inline">
+              <input type="hidden" name="src_user_id" value="{{ [user.id, m.id]|min }}">
+              <input type="hidden" name="dst_user_id" value="{{ [user.id, m.id]|max }}">
+              <input type="hidden" name="action" value="decline">
+              <button class="btn-badge" style="opacity:.8">Reddet</button>
+            </form>
+          {% else %}
+            <form method="post" action="{{ url_for('connect_request', club_id=club.id) }}" style="display:inline">
+              <input type="hidden" name="target_user_id" value="{{ m.id }}">
+              <button class="btn-badge">Bağlan</button>
+            </form>
+          {% endif %}
+        {% endif %}
       </td>
     </tr>
     {% endfor %}
