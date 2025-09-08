@@ -1,156 +1,214 @@
 # connect_routes.py
-import time
+import os, time
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from flask import Blueprint, request, redirect, url_for, flash, abort, session
-from sqlalchemy import text
 
 bp = Blueprint("connections", __name__)
 
-def now_ts():
+# ---------- DB helpers (psycopg2) ----------
+def _get_db_params():
+    """
+    Railway genelde DATABASE_URL verir.
+    Yoksa manuel env değişkenleri veya app.py’de kullandığın değerlerle doldur.
+    """
+    url = os.getenv("DATABASE_URL")
+    if url:
+        # psycopg2 DSN formatını kabul eder
+        return {"dsn": url}
+    # Yedek: manuel param (app.py’de olanları buraya da yansıt)
+    return {
+        "dbname": os.getenv("PGDATABASE", "railway"),
+        "user": os.getenv("PGUSER", "postgres"),
+        "password": os.getenv("PGPASSWORD", "postgres"),
+        "host": os.getenv("PGHOST", "localhost"),
+        "port": int(os.getenv("PGPORT", "5432")),
+    }
+
+def get_db_connection():
+    params = _get_db_params()
+    if "dsn" in params:
+        return psycopg2.connect(params["dsn"], cursor_factory=RealDictCursor)
+    return psycopg2.connect(
+        dbname=params["dbname"],
+        user=params["user"],
+        password=params["password"],
+        host=params["host"],
+        port=params["port"],
+        cursor_factory=RealDictCursor,
+    )
+
+def now_ts() -> float:
     return float(time.time())
 
 def canonical_pair(a: int, b: int):
     return (a, b) if a <= b else (b, a)
 
-# ---- Bu yardımcılar, ana uygulamadaki fonksiyonlarınıza delegasyon içindir.
-# app.py içinde aynı isimlerle fonksiyonlarınız varsa onları kullanın.
-def get_engine(app):
-    return app.config.get("SQLALCHEMY_ENGINE") or app.extensions["engine"]
+# ---------- Schema bootstrap ----------
+def ensure_graph_table():
+    """
+    PostgreSQL ile uyumlu DDL.
+    Railway ilk istekte tabloyu oluşturur; varsa zarar vermez.
+    """
+    ddl = """
+    CREATE TABLE IF NOT EXISTS graph_edges(
+      id SERIAL PRIMARY KEY,
+      club_id INTEGER NOT NULL,
+      src_user_id INTEGER NOT NULL,
+      dst_user_id INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',   -- pending|accepted|declined
+      requested_by INTEGER,
+      created_at DOUBLE PRECISION,
+      responded_at DOUBLE PRECISION,
+      UNIQUE (club_id, src_user_id, dst_user_id)
+    );
+    """
+    with get_db_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(ddl)
+        conn.commit()
 
-def current_user_id():
-    return session.get("uid") or session.get("user_id")
+def is_member(club_id: int, user_id: int) -> bool:
+    with get_db_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                SELECT 1 FROM club_members WHERE club_id = %s AND user_id = %s
+            """, (club_id, user_id))
+            row = c.fetchone()
+            return bool(row)
 
-def is_member(engine, club_id: int, user_id: int) -> bool:
-    with engine.begin() as con:
-        row = con.execute(text("""
-          SELECT 1 FROM club_members WHERE club_id=:c AND user_id=:u
-        """), {"c": club_id, "u": user_id}).first()
-        return bool(row)
+# İstersen admin-like kısıt koyarsın; şimdilik sadece üyelik yeter
+def can_interact(club_id: int, user_id: int) -> bool:
+    return is_member(club_id, user_id)
 
-def is_admin_or_owner(engine, club_id: int, user_id: int) -> bool:
-    with engine.begin() as con:
-        role = con.execute(text("""
-          SELECT COALESCE(LOWER(role),'member') FROM club_members WHERE club_id=:c AND user_id=:u
-        """), {"c": club_id, "u": user_id}).scalar()
-        owner = con.execute(text("SELECT owner_user_id FROM clubs WHERE id=:c"), {"c": club_id}).scalar()
-        return bool((role and role != "member") or (owner == user_id))
-
-def ensure_graph_table(engine):
-    with engine.begin() as con:
-        # Postgres/SQLite uyumlu light DDL
-        con.exec_driver_sql("""
-        CREATE TABLE IF NOT EXISTS graph_edges(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          club_id INTEGER NOT NULL,
-          src_user_id INTEGER NOT NULL,
-          dst_user_id INTEGER NOT NULL,
-          status TEXT NOT NULL DEFAULT 'pending',   -- pending|accepted|declined
-          requested_by INTEGER,
-          created_at REAL,
-          responded_at REAL,
-          UNIQUE (club_id, src_user_id, dst_user_id)
-        )
-        """)
-        # Postgres'ta AUTOINCREMENT yerine SERIAL kullanılıyor olabilir; varsa yoksa zaten tablo mevcuttur.
-
-@bp.before_app_first_request
-def _prepare():
-    engine = get_engine(bp.app)
-    ensure_graph_table(engine)
+# ---------- Routes ----------
+@bp.before_app_request
+def _boot_if_needed():
+    # Her request’te hızlı kontrol; tablo yoksa oluştur.
+    # (CREATE IF NOT EXISTS cheap’tir; sorun olmaz)
+    ensure_graph_table()
 
 @bp.post("/clubs/<int:club_id>/connect/request")
 def connect_request(club_id):
-    uid = current_user_id()
-    if not uid: return abort(401)
+    uid = session.get("uid") or session.get("user_id")
+    if not uid:
+        return abort(401)
+
     target = request.form.get("target_user_id", type=int)
     if not target or target == uid:
         flash("Hedef kullanıcı geçersiz.", "warning")
         return redirect(url_for("club_dashboard", club_id=club_id))
 
-    engine = get_engine(bp.app)
-    if not is_member(engine, club_id, uid) or not is_member(engine, club_id, target):
+    if not (can_interact(club_id, uid) and can_interact(club_id, target)):
         flash("Her iki tarafın da kulüp üyesi olması gerekir.", "danger")
         return redirect(url_for("club_dashboard", club_id=club_id))
 
     s, d = canonical_pair(uid, target)
-    with engine.begin() as con:
-        row = con.execute(text("""
-          SELECT status FROM graph_edges WHERE club_id=:c AND src_user_id=:s AND dst_user_id=:d
-        """), {"c": club_id, "s": s, "d": d}).mappings().first()
 
-        if row is None:
-            con.execute(text("""
-              INSERT INTO graph_edges (club_id, src_user_id, dst_user_id, status, requested_by, created_at)
-              VALUES (:c,:s,:d,'pending',:rq,:t)
-            """), {"c": club_id, "s": s, "d": d, "rq": uid, "t": now_ts()})
-            flash("Bağlantı isteği gönderildi.", "success")
-        else:
-            st = (row["status"] or "").lower()
-            if st == "accepted":
-                flash("Zaten bağlısınız.", "info")
-            elif st == "pending":
-                flash("Zaten bekleyen bir istek var.", "info")
+    with get_db_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                SELECT status FROM graph_edges 
+                WHERE club_id=%s AND src_user_id=%s AND dst_user_id=%s
+            """, (club_id, s, d))
+            row = c.fetchone()
+
+            if row is None:
+                c.execute("""
+                    INSERT INTO graph_edges (club_id, src_user_id, dst_user_id, status, requested_by, created_at)
+                    VALUES (%s, %s, %s, 'pending', %s, %s)
+                """, (club_id, s, d, uid, now_ts()))
+                conn.commit()
+                flash("Bağlantı isteği gönderildi.", "success")
             else:
-                con.execute(text("""
-                  UPDATE graph_edges SET status='pending', requested_by=:rq, responded_at=NULL
-                  WHERE club_id=:c AND src_user_id=:s AND dst_user_id=:d
-                """), {"rq": uid, "c": club_id, "s": s, "d": d})
-                flash("Bağlantı isteği tekrar gönderildi.", "success")
+                st = (row["status"] or "").lower()
+                if st == "accepted":
+                    flash("Zaten bağlısınız.", "info")
+                elif st == "pending":
+                    flash("Zaten bekleyen bir istek var.", "info")
+                else:
+                    c.execute("""
+                        UPDATE graph_edges 
+                        SET status='pending', requested_by=%s, responded_at=NULL
+                        WHERE club_id=%s AND src_user_id=%s AND dst_user_id=%s
+                    """, (uid, club_id, s, d))
+                    conn.commit()
+                    flash("Bağlantı isteği tekrar gönderildi.", "success")
+
     return redirect(url_for("club_dashboard", club_id=club_id))
 
 @bp.post("/clubs/<int:club_id>/connect/cancel")
 def connect_cancel(club_id):
-    uid = current_user_id()
-    if not uid: return abort(401)
+    uid = session.get("uid") or session.get("user_id")
+    if not uid:
+        return abort(401)
+
     target = request.form.get("target_user_id", type=int)
-    if not target: return abort(400)
+    if not target:
+        return abort(400)
 
     s, d = canonical_pair(uid, target)
-    engine = get_engine(bp.app)
-    with engine.begin() as con:
-        row = con.execute(text("""
-          SELECT status, requested_by FROM graph_edges 
-          WHERE club_id=:c AND src_user_id=:s AND dst_user_id=:d
-        """), {"c": club_id, "s": s, "d": d}).mappings().first()
-        if not row or row["status"] != "pending" or row["requested_by"] != uid:
-            flash("İptal edilecek bekleyen isteğin yok.", "warning")
-        else:
-            con.execute(text("""
-              DELETE FROM graph_edges 
-              WHERE club_id=:c AND src_user_id=:s AND dst_user_id=:d AND status='pending' AND requested_by=:rq
-            """), {"c": club_id, "s": s, "d": d, "rq": uid})
-            flash("İstek iptal edildi.", "success")
+
+    with get_db_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                SELECT status, requested_by FROM graph_edges
+                WHERE club_id=%s AND src_user_id=%s AND dst_user_id=%s
+            """, (club_id, s, d))
+            row = c.fetchone()
+
+            if (not row) or (row["status"] != "pending") or (row["requested_by"] != uid):
+                flash("İptal edilecek bekleyen bir isteğin yok.", "warning")
+            else:
+                c.execute("""
+                    DELETE FROM graph_edges
+                    WHERE club_id=%s AND src_user_id=%s AND dst_user_id=%s
+                      AND status='pending' AND requested_by=%s
+                """, (club_id, s, d, uid))
+                conn.commit()
+                flash("İstek iptal edildi.", "success")
+
     return redirect(url_for("club_dashboard", club_id=club_id))
 
 @bp.post("/clubs/<int:club_id>/connect/respond")
 def connect_respond(club_id):
-    uid = current_user_id()
-    if not uid: return abort(401)
+    uid = session.get("uid") or session.get("user_id")
+    if not uid:
+        return abort(401)
+
     s = request.form.get("src_user_id", type=int)
     d = request.form.get("dst_user_id", type=int)
     action = (request.form.get("action") or "").strip().lower()
-    if not (s and d and action in {"accept","decline"}): return abort(400)
+    if not (s and d and action in {"accept", "decline"}):
+        return abort(400)
+
     if uid not in (s, d):
         return abort(403)
 
-    engine = get_engine(bp.app)
-    with engine.begin() as con:
-        row = con.execute(text("""
-          SELECT status, requested_by FROM graph_edges 
-          WHERE club_id=:c AND src_user_id=:s AND dst_user_id=:d
-        """), {"c": club_id, "s": s, "d": d}).mappings().first()
-        if not row or (row["status"] or "").lower() != "pending":
-            flash("Bekleyen bir istek bulunamadı.", "warning")
-            return redirect(url_for("club_dashboard", club_id=club_id))
-        if row["requested_by"] == uid:
-            flash("Kendi gönderdiğin isteği kabul/ret edemezsin.", "warning")
-            return redirect(url_for("club_dashboard", club_id=club_id))
+    with get_db_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                SELECT status, requested_by FROM graph_edges
+                WHERE club_id=%s AND src_user_id=%s AND dst_user_id=%s
+            """, (club_id, s, d))
+            row = c.fetchone()
 
-        new_status = "accepted" if action == "accept" else "declined"
-        con.execute(text("""
-          UPDATE graph_edges 
-          SET status=:st, responded_at=:t
-          WHERE club_id=:c AND src_user_id=:s AND dst_user_id=:d
-        """), {"st": new_status, "t": now_ts(), "c": club_id, "s": s, "d": d})
-        flash("Seçimin kaydedildi.", "success")
+            if (not row) or (row["status"] or "").lower() != "pending":
+                flash("Bekleyen bir istek bulunamadı.", "warning")
+                return redirect(url_for("club_dashboard", club_id=club_id))
+
+            if row["requested_by"] == uid:
+                flash("Kendi gönderdiğin isteği kabul/ret edemezsin.", "warning")
+                return redirect(url_for("club_dashboard", club_id=club_id))
+
+            new_status = "accepted" if action == "accept" else "declined"
+            c.execute("""
+                UPDATE graph_edges
+                SET status=%s, responded_at=%s
+                WHERE club_id=%s AND src_user_id=%s AND dst_user_id=%s
+            """, (new_status, now_ts(), club_id, s, d))
+            conn.commit()
+            flash("Seçimin kaydedildi.", "success")
+
     return redirect(url_for("club_dashboard", club_id=club_id))
 
