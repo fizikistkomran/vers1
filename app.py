@@ -1,4 +1,4 @@
-# app.py — club dashboard içinde gömülü grafik (embed) entegrasyonlu tam sürüm
+# app.py — friendship graph (connect requests) entegre tam sürüm
 
 import os, io, csv, smtplib, ssl, json, time, traceback, secrets
 from email.message import EmailMessage
@@ -8,6 +8,7 @@ import certifi
 import qrcode
 from PIL import Image
 from werkzeug.utils import secure_filename
+
 
 from flask import (
     Flask, render_template, render_template_string, redirect, url_for, session,
@@ -55,6 +56,9 @@ def current_ts_sql(engine) -> str:
     return "EXTRACT(EPOCH FROM NOW())" if is_postgres(engine) else "strftime('%s','now')"
 
 def create_schema(engine):
+    """
+    Çekirdek tablolar + yeni banner/logo kolonları + görev/not tabloları + graph_edges.
+    """
     ts_default = current_ts_sql(engine)
 
     if is_postgres(engine):
@@ -116,8 +120,8 @@ def create_schema(engine):
               src_user_id INTEGER NOT NULL,
               dst_user_id INTEGER NOT NULL,
               status TEXT NOT NULL DEFAULT 'accepted', -- pending|accepted|declined
-              requested_by INTEGER,
-              responded_at DOUBLE PRECISION,
+              requested_by INTEGER,                    -- isteği başlatan
+              responded_at DOUBLE PRECISION,           -- karar zamanı
               created_at DOUBLE PRECISION DEFAULT ({ts_default}),
               UNIQUE (club_id, src_user_id, dst_user_id)
             );""",
@@ -239,19 +243,25 @@ def create_schema(engine):
             con.exec_driver_sql(sql)
 
 def ensure_columns(engine):
+    """
+    Eski DB'lerde eksik kolonları güvenli şekilde ekler.
+    """
     try:
         with engine.begin() as con:
             if is_postgres(engine):
+                # users / clubs / events mevcut eklemeler
                 con.exec_driver_sql("ALTER TABLE users  ADD COLUMN IF NOT EXISTS avatar_cached_at DOUBLE PRECISION")
                 con.exec_driver_sql("ALTER TABLE users  ADD COLUMN IF NOT EXISTS edu_email TEXT")
                 con.exec_driver_sql("ALTER TABLE clubs  ADD COLUMN IF NOT EXISTS banner_url TEXT")
                 con.exec_driver_sql("ALTER TABLE clubs  ADD COLUMN IF NOT EXISTS logo_url TEXT")
                 con.exec_driver_sql("ALTER TABLE events ADD COLUMN IF NOT EXISTS banner_url TEXT")
                 con.exec_driver_sql("ALTER TABLE events ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'event'")
+                # graph_edges yeni alanlar
                 con.exec_driver_sql("ALTER TABLE graph_edges ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'accepted'")
                 con.exec_driver_sql("ALTER TABLE graph_edges ADD COLUMN IF NOT EXISTS requested_by INTEGER")
                 con.exec_driver_sql("ALTER TABLE graph_edges ADD COLUMN IF NOT EXISTS responded_at DOUBLE PRECISION")
             else:
+                # sqlite pragma ile kontrol
                 def has_col(table, col):
                     rows = con.execute(text(f"PRAGMA table_info({table})")).fetchall()
                     names = [r[1] for r in rows]
@@ -336,6 +346,7 @@ def _download_image_to_local(url: str, out_path: str) -> bool:
         return False
 
 def _file_to_local(file_storage, out_dir: str, filename_base: str) -> str:
+    """Werkzeug FileStorage -> local jpg path; returns web URL under /static/uploads/..."""
     if not file_storage or not getattr(file_storage, "filename", None):
         return None
     fname = secure_filename(file_storage.filename)
@@ -346,11 +357,13 @@ def _file_to_local(file_storage, out_dir: str, filename_base: str) -> str:
         raise ValueError("Dosya çok büyük (10MB üstü).")
     out_path = os.path.join(out_dir, f"{filename_base}.jpg")
     _resize_and_save(raw, out_path)
+    # web path:
     web_rel = out_path.split(os.path.join(BASE_DIR, "static"))[-1].replace("\\","/")
     return "/static" + web_rel
 
 # ----------------------- Graph helpers -----------------------
 def canonical_pair(a: int, b: int):
+    """Undirected edge için kanonik (src,dst) sıralaması"""
     return (a, b) if a <= b else (b, a)
 
 # --------------------------------------------------------------
@@ -361,8 +374,11 @@ def create_app():
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
     app.config["SESSION_COOKIE_SECURE"]   = False
     app.config["MAX_CONTENT_LENGTH"]      = 12 * 1024 * 1024  # 12MB
+    from connect_routes import bp as connections_bp
+    app.register_blueprint(connections_bp)
 
     # --- DB ---
+    # URL'i normalize et (Railway/SQLAlchemy uyumu)
     DB_URL = os.getenv("DATABASE_URL", "sqlite:///enfekte.db")
     if DB_URL.startswith("postgres://"):
         DB_URL = DB_URL.replace("postgres://", "postgresql+psycopg2://", 1)
@@ -386,6 +402,7 @@ def create_app():
         connect_args={"connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "10"))} if DB_URL.startswith("postgresql") else {},
     )
 
+    # İlk bağlantıyı birkaç kez dene (soğuk uyanma)
     attempts = int(os.getenv("DB_CONNECT_ATTEMPTS", "5"))
     delay = 1.0
     last_err = None
@@ -403,6 +420,7 @@ def create_app():
                 time.sleep(delay)
                 delay = delay + 1 if delay < 3 else delay * 1.6
     if last_err:
+        # Açık hata; Railway loglarında net görünür
         raise last_err
 
     create_schema(engine)
@@ -410,6 +428,7 @@ def create_app():
 
     serializer = URLSafeTimedSerializer(app.config["SECRET_KEY"])
 
+    # ---------- Helpers ----------
     ADMIN_LIKE_ROLES = set([r.strip().lower() for r in os.getenv(
         "ADMIN_LIKE_ROLES",
         "owner,admin,officer,coordinator,manager,lead,moderator,editor"
@@ -539,6 +558,7 @@ def create_app():
               ORDER BY c.name
             """), {"u": user["id"]}).mappings().all()
 
+        # Fallback profil şablonu
         fallback = f"""
         <div style='display:flex;gap:20px;align-items:center'>
           <img src='{user.get('avatar_url') or '/static/avatar-placeholder.png'}' alt='avatar' style='width:120px;height:120px;border-radius:50%;object-fit:cover;border:2px solid #333' />
@@ -572,7 +592,7 @@ def create_app():
             """).bindparams(roles=tuple(ADMIN_LIKE_ROLES)), {"u": user["id"]}).mappings().all()
         return render_template("panels.html", user=user, admin_clubs=admin_clubs)
 
-    # ===================== KULÜP PANELİ (gömülü grafik ile) =====================
+    # ===================== KULÜP PANELİ =====================
     @app.get("/clubs/<int:club_id>")
     def club_dashboard(club_id):
         user = current_user()
@@ -603,8 +623,7 @@ def create_app():
             """), {"c": club_id}).mappings().all()
 
         owner = is_admin_or_owner(club_id, user["id"])
-
-        # Fallback dashboard + GÖMÜLÜ GRAF (iframe)
+        # Fallback bannerli görünüm + üyelerde bağlan/kabul/iptal
         connect_rows = []
         for m in members:
             if m["id"] == user["id"]:
@@ -625,6 +644,7 @@ def create_app():
                           <button class="btn-badge" style="opacity:.8">İsteği İptal Et</button>
                         </form>"""
                     else:
+                        # gelen isteği kabul/ret
                         s, d = canonical_pair(user["id"], m["id"])
                         btn = f"""
                         <form method="post" action="{url_for('connect_respond', club_id=club_id)}" style="display:inline;margin-right:6px">
@@ -655,19 +675,6 @@ def create_app():
               </tr>
             """)
 
-        # Embed grafiği sadece admin-like görsün (aynı kural /graph sayfasındaki gibi)
-        graph_embed = ""
-        if owner:
-            graph_embed = f"""
-            <h3 style="margin:18px 0 8px">Topluluk Ağı</h3>
-            <iframe src="{url_for('club_graph_embed', club_id=club_id)}"
-                    style="width:100%;height:560px;border:1px solid #222;border-radius:12px;background:#111"
-                    loading="lazy" referrerpolicy="no-referrer"></iframe>
-            <div style="margin-top:8px">
-              <a href="{url_for('club_graph', club_id=club_id)}" style="opacity:.8">Tam ekran aç</a>
-            </div>
-            """
-
         fallback = f"""
         <div style="position:relative;border-radius:16px;overflow:hidden;border:1px solid #222">
           <div style="height:180px;background:#222 url('{club.get('banner_url') or ''}') center/cover no-repeat"></div>
@@ -678,10 +685,9 @@ def create_app():
         </div>
         <div style="margin-top:16px;display:flex;gap:24px;flex-wrap:wrap">
           <a href="{url_for('club_members', club_id=club_id)}">Üyeler & Roller</a>
-          <a href="{url_for('club_graph', club_id=club_id)}">Grafik (tam)</a>
+          <a href="{url_for('club_graph', club_id=club_id)}">Grafik (beta)</a>
           <a href="{url_for('club_analytics', club_id=club_id)}">Analitik</a>
         </div>
-        {graph_embed}
         <h3 style="margin-top:18px">Üyeler</h3>
         <table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse">
           <tr><th>Üye</th><th>Rol</th><th>Bağlantı</th></tr>
@@ -710,8 +716,9 @@ def create_app():
               ORDER BY u.name
             """), {"c": club_id}).mappings().all()
 
-        roles = sorted({"member"} | ADMIN_LIKE_ROLES - {"owner"})
+        roles = sorted({"member"} | ADMIN_LIKE_ROLES - {"owner"})  # owner ataması buradan yapılmaz
 
+        # Fallback form + bağlanma butonları
         rows = []
         for m in members:
             connect_part = ""
@@ -812,6 +819,7 @@ def create_app():
         return redirect(url_for("club_members", club_id=club_id))
 
     # ===================== FRIENDSHIP / CONNECTIONS =====================
+
     @app.post("/clubs/<int:club_id>/connect/request")
     def connect_request(club_id):
         user = current_user()
@@ -822,6 +830,7 @@ def create_app():
             flash("Kendinle bağlantı kuramazsın.", "warning")
             return redirect(url_for("club_dashboard", club_id=club_id))
 
+        # ikisi de kulüp üyesi mi?
         with engine.begin() as con:
             mine = con.execute(text("SELECT 1 FROM club_members WHERE club_id=:c AND user_id=:u"),
                                {"c": club_id, "u": user["id"]}).first()
@@ -851,6 +860,7 @@ def create_app():
                 elif st == "pending":
                     flash("Zaten bekleyen bir istek var.", "info")
                 elif st == "declined":
+                    # tekrar deneyebilir: pending'e çevir
                     con.execute(text("""
                       UPDATE graph_edges SET status='pending', requested_by=:rq, responded_at=NULL
                       WHERE club_id=:c AND src_user_id=:s AND dst_user_id=:d
@@ -891,6 +901,7 @@ def create_app():
         if not (s and d and action in {"accept","decline"}):
             return abort(400)
 
+        # current user ikilinin üyelerinden biri olmalı ve pending olmalı
         if user["id"] not in (s, d):
             return abort(403)
         with engine.begin() as con:
@@ -901,6 +912,7 @@ def create_app():
             if not row or row["status"] != "pending":
                 flash("Bekleyen bir istek bulunamadı.", "warning")
                 return redirect(url_for("club_dashboard", club_id=club_id))
+            # isteği yanıtlayan taraf, requested_by dışında olan kullanıcı olmalı
             if row["requested_by"] == user["id"]:
                 flash("Kendi gönderdiğin isteği kabul/ret edemezsin.", "warning")
                 return redirect(url_for("club_dashboard", club_id=club_id))
@@ -942,7 +954,144 @@ def create_app():
             """), {"c": club_id, "u": user["id"]}).mappings().all()
         return jsonify({"accepted": [dict(r) for r in rows]})
 
-    # ===================== ANALİZ / GRAF =====================
+    # ===================== ANALİZ SAYFALARI (yalnız admin-like) =====================
+    def _event_analytics_impl(event_id):
+        user = current_user()
+        if not user: return redirect(url_for("home"))
+
+        with engine.begin() as con:
+            ev = con.execute(text("SELECT * FROM events WHERE id=:id"), {"id": event_id}).mappings().first()
+            if not ev: abort(404)
+            club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": ev["club_id"]}).mappings().first()
+            if not club: abort(404)
+
+            is_member, is_admin = user_membership(ev["club_id"], user["id"])
+            if not is_admin:
+                flash("Etkinlik analitiğine sadece admin-like profiller erişebilir.", "warning")
+                return redirect(url_for("club_dashboard", club_id=ev["club_id"]))
+
+            attendees = con.execute(text("""
+              SELECT u.id, u.name, u.avatar_url, u.edu_email, ci.checked_at
+              FROM checkins ci JOIN users u ON u.id=ci.user_id
+              WHERE ci.event_id=:e
+              ORDER BY u.name
+            """), {"e": event_id}).mappings().all()
+
+            member_count = con.execute(text("""
+              SELECT COUNT(*) FROM club_members WHERE club_id=:c
+            """), {"c": ev["club_id"]}).scalar() or 0
+
+            events_all = con.execute(text("""
+              SELECT id, title, COALESCE(starts_at, created_at) AS tkey, created_at
+              FROM events WHERE club_id=:c ORDER BY COALESCE(starts_at, created_at) ASC, id ASC
+            """), {"c": ev["club_id"]}).mappings().all()
+
+            cur_key = ev["starts_at"] if ev["starts_at"] else ev["created_at"]
+            next_id = None
+            for e in events_all:
+                if e["id"] == ev["id"]:
+                    continue
+                if e["tkey"] and cur_key and e["tkey"] > cur_key:
+                    next_id = e["id"]; break
+            if not next_id and len(events_all) >= 2:
+                ids = [x["id"] for x in events_all]
+                try:
+                    idx = ids.index(ev["id"])
+                    if idx < len(ids) - 1: next_id = ids[idx+1]
+                except ValueError:
+                    pass
+
+            total_att = len(attendees)
+            continued = 0
+            if next_id and total_att > 0:
+                ids = [str(a["id"]) for a in attendees]
+                placeholders = ",".join(ids) if ids else "0"
+                q = text(f"SELECT COUNT(*) FROM checkins WHERE event_id=:ne AND user_id IN ({placeholders})")
+                continued = con.execute(q, {"ne": next_id}).scalar() or 0
+
+            new_edges_after = con.execute(text("""
+              SELECT COUNT(*) FROM graph_edges 
+              WHERE club_id=:c AND status='accepted' AND created_at >= :t0
+            """), {"c": ev["club_id"], "t0": ev["created_at"]}).scalar() or 0
+
+        att_rate = (total_att / member_count * 100.0) if member_count else 0.0
+        cont_rate = (continued / total_att * 100.0) if total_att else 0.0
+
+        # Fallback: basit rapor
+        fallback = f"""
+        <h2>{club['name']} · {ev['title']} (Analitik)</h2>
+        <div>Katılım: <b>{total_att}</b> / Üye: <b>{member_count}</b> → <b>{att_rate:.1f}%</b></div>
+        <div>Bir sonraki etkinliğe geri dönenler: <b>{continued}</b> → <b>{cont_rate:.1f}%</b></div>
+        <div>Yeni bağlantılar (sonrasında): <b>{new_edges_after}</b></div>
+        """
+        return try_render("event_analytics.html",
+                          user=user, club=club, event=ev,
+                          attendees=attendees,
+                          member_count=member_count, total_att=total_att,
+                          att_rate=att_rate, continued=continued, cont_rate=cont_rate,
+                          new_edges_after=new_edges_after,
+                          page_title="Etkinlik Analitiği", fallback_html=fallback)
+
+    @app.get("/events/<int:event_id>/analysis")
+    def event_analytics(event_id):
+        return _event_analytics_impl(event_id)
+
+    @app.get("/events/<int:event_id>/analytics")
+    def event_analytics_alias(event_id):
+        return _event_analytics_impl(event_id)
+
+    @app.get("/clubs/<int:club_id>/analytics")
+    def club_analytics(club_id):
+        user = current_user()
+        if not user: return redirect(url_for("home"))
+        is_member, is_admin = user_membership(club_id, user["id"])
+        if not is_admin:
+            flash("Kulüp analitiğine sadece admin-like profiller erişebilir.", "warning")
+            return redirect(url_for("club_dashboard", club_id=club_id))
+
+        with engine.begin() as con:
+            club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": club_id}).mappings().first()
+            events = con.execute(text("""
+              SELECT e.id, e.title, e.category, e.starts_at, e.created_at,
+                     COALESCE(e.starts_at, e.created_at) AS tkey,
+                     (SELECT COUNT(*) FROM checkins ci WHERE ci.event_id=e.id) AS checkin_count
+              FROM events e 
+              WHERE e.club_id=:c 
+              ORDER BY COALESCE(e.starts_at, e.created_at) ASC, e.id ASC
+            """), {"c": club_id}).mappings().all()
+
+            member_count = con.execute(text("SELECT COUNT(*) FROM club_members WHERE club_id=:c"),
+                                       {"c": club_id}).scalar() or 0
+
+            # graph kenarları (accepted)
+            edge_rows = con.execute(text("""
+              SELECT src_user_id, dst_user_id FROM graph_edges 
+              WHERE club_id=:c AND status='accepted'
+            """), {"c": club_id}).all()
+
+        total_events = len(events)
+        total_checkins = sum(e["checkin_count"] for e in events)
+        # graph metrikleri
+        N = member_count
+        E = len(edge_rows)
+        density = (2*E / (N*(N-1))) if (N and N>1) else 0.0
+
+        fallback = f"""
+        <h2>{club['name']} · Analitik</h2>
+        <div>Etkinlik sayısı: <b>{total_events}</b></div>
+        <div>Toplam yoklama: <b>{total_checkins}</b></div>
+        <div>Ağ yoğunluğu (accepted): <b>{density:.3f}</b> (E={E}, N={N})</div>
+        <p style='margin-top:8px'><a href="{url_for('club_graph', club_id=club_id)}">Arkadaşlık Grafiğini gör</a></p>
+        """
+        return try_render("club_analysis.html",
+                          user=user, club=club, events=events,
+                          member_count=member_count,
+                          total_events=total_events,
+                          total_checkins=total_checkins,
+                          graph_density=density,
+                          page_title="Kulüp Analitiği", fallback_html=fallback)
+
+    # ===================== GRAF (D3) + TIMELAPSE =====================
     @app.get("/clubs/<int:club_id>/graph")
     def club_graph(club_id):
         user = current_user()
@@ -957,80 +1106,121 @@ def create_app():
             club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": club_id}).mappings().first()
             max_ts = con.execute(text("SELECT MAX(created_at) FROM graph_edges WHERE club_id=:c"), {"c": club_id}).scalar() or now_ts()
 
+        # f-string KULLANMADAN Jinja ile render edilecek fallback HTML/JS
+        tmpl = """
+        <!doctype html>
+        <meta charset="utf-8">
+        <title>{{ club.name }} · Ağ Haritası</title>
+        <div style="padding:12px;font-family:system-ui;color:#eee;background:#111">
+          <h2 style="margin:8px 0 12px">{{ club.name }} · Ağ Haritası (beta)</h2>
+          <div style="margin-bottom:8px; display:flex; gap:10px; align-items:center">
+            <label><input id="togglePending" type="checkbox"/> bekleyen istekleri de göster</label>
+          </div>
+          <div id="graph" style="width:100%;height:520px;border:1px solid #222;border-radius:12px"></div>
+          <div style="margin-top:8px">
+            <input id="timeRange" type="range" min="0" max="{{ max_ts|int }}" value="{{ max_ts|int }}" style="width:100%" />
+            <div style="display:flex;justify-content:space-between;font-size:12px;opacity:.7">
+              <span>başlangıç</span><span>şimdi</span>
+            </div>
+          </div>
+        </div>
+        <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+        <script>
+        const clubId = {{ club_id }};
+        const graphEl = document.getElementById('graph');
+        const slider  = document.getElementById('timeRange');
+        const togglePending = document.getElementById('togglePending');
+
+        let svg, width, height, simulation, link, node, label, pendingLink;
+
+        function init(){
+          width = graphEl.clientWidth;
+          height = graphEl.clientHeight;
+          svg = d3.select('#graph').append('svg')
+            .attr('width', width).attr('height', height)
+            .style('background','#111');
+          link = svg.append('g').attr('stroke','#6aa0ff').attr('stroke-opacity',0.9).selectAll('line');
+          pendingLink = svg.append('g').attr('stroke','#888').attr('stroke-opacity',0.4).attr('stroke-dasharray','4 4').selectAll('line');
+          node = svg.append('g').attr('stroke','#fff').attr('stroke-width',1).selectAll('circle');
+          label= svg.append('g').selectAll('text');
+          simulation = d3.forceSimulation()
+            .force('link', d3.forceLink().id(d=>d.id).distance(60))
+            .force('charge', d3.forceManyBody().strength(-180))
+            .force('center', d3.forceCenter(width/2, height/2));
+          fetchAndRender();
+        }
+
+        function fetchAndRender(){
+          const until = slider.value;
+          const includePending = togglePending.checked ? 1 : 0;
+          fetch(`/clubs/${clubId}/graph.json?until=${until}&include_pending=${includePending}`)
+            .then(r=>r.json())
+            .then(data=>{
+              link = link.data(data.edges, d=>d.source+'-'+d.target);
+              link.exit().remove();
+              link = link.enter().append('line').merge(link);
+
+              pendingLink = pendingLink.data(data.pending_edges || [], d=>d.source+'-'+d.target);
+              pendingLink.exit().remove();
+              pendingLink = pendingLink.enter().append('line').merge(pendingLink);
+
+              node = node.data(data.nodes, d=>d.id);
+              node.exit().remove();
+              node = node.enter().append('circle')
+                .attr('r', 10)
+                .attr('fill', '#2e8bfa')
+                .call(drag(simulation))
+                .merge(node);
+
+              label = label.data(data.nodes, d=>d.id);
+              label.exit().remove();
+              label = label.enter().append('text')
+                .text(d=>d.label)
+                .attr('fill','#ddd')
+                .attr('font-size',11)
+                .merge(label);
+
+              simulation.nodes(data.nodes).on('tick', ticked);
+              const allLinks = [...data.edges, ...(data.pending_edges||[])];
+              simulation.force('link').links(allLinks);
+              simulation.alpha(0.8).restart();
+            });
+        }
+
+        function ticked(){
+          link.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y)
+              .attr('x2', d=>d.target.x).attr('y2', d=>d.target.y);
+          pendingLink.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y)
+              .attr('x2', d=>d.target.x).attr('y2', d=>d.target.y);
+          node.attr('cx', d=>d.x).attr('cy', d=>d.y);
+          label.attr('x', d=>d.x+12).attr('y', d=>d.y+4);
+        }
+
+        function drag(sim){
+          function dragstarted(event, d){
+            if (!event.active) sim.alphaTarget(0.3).restart();
+            d.fx = d.x; d.fy = d.y;
+          }
+          function dragged(event,d){ d.fx = event.x; d.fy = event.y; }
+          function dragended(event,d){
+            if (!event.active) sim.alphaTarget(0);
+            d.fx = null; d.fy = null;
+          }
+          return d3.drag().on('start',dragstarted).on('drag',dragged).on('end',dragended);
+        }
+
+        // basit debounce
+        let t=null;
+        slider.addEventListener('input', ()=>{ clearTimeout(t); t=setTimeout(fetchAndRender,180); });
+        togglePending.addEventListener('change', fetchAndRender);
+        window.addEventListener('resize', ()=>{ d3.select('#graph svg').remove(); init(); });
+        init();
+        </script>
+        """
         try:
             return render_template("club_graph.html", user=user, club=club, club_id=club_id, max_ts=int(max_ts))
         except TemplateNotFound:
-            # Basit fallback tam sayfa (önceden verdiğimizle aynı)
-            tmpl = """
-            <!doctype html><meta charset="utf-8"><title>{{ club.name }} · Ağ Haritası</title>
-            <div id="graph" style="height:520px"></div>
-            <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
-            <script>
-            const clubId={{ club_id }};
-            const graphEl=document.getElementById('graph');
-            let svg,w=graphEl.clientWidth,h=graphEl.clientHeight,sim,links,nodes;
-            function init(){
-              svg=d3.select('#graph').append('svg').attr('width',w).attr('height',h).style('background','#111');
-              const g=svg.append('g'); const linkG=g.append('g'); const pendG=g.append('g').attr('stroke-dasharray','4 4').attr('stroke','#888').attr('stroke-opacity',.5); const nodeG=g.append('g'); const labelG=g.append('g');
-              fetch(`/clubs/${clubId}/graph.json`).then(r=>r.json()).then(data=>{
-                nodes=data.nodes; links=data.edges.map(e=>({...e}));
-                const byId=new Map(nodes.map(n=>[n.id,n]));
-                links=links.map(l=>({source:byId.get(l.source),target:byId.get(l.target)})).filter(l=>l.source&&l.target);
-                sim=d3.forceSimulation(nodes).force('link',d3.forceLink(links).id(d=>d.id).distance(62)).force('charge',d3.forceManyBody().strength(-200)).force('center',d3.forceCenter(w/2,h/2));
-                const link=linkG.selectAll('line').data(links).enter().append('line').attr('stroke','#6aa0ff').attr('stroke-opacity',.9);
-                const node=nodeG.selectAll('circle').data(nodes).enter().append('circle').attr('r',10).attr('fill','#2e8bfa');
-                const label=labelG.selectAll('text').data(nodes).enter().append('text').text(d=>d.label).attr('fill','#ddd').attr('font-size',11);
-                sim.on('tick',()=>{ link.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y).attr('x2',d=>d.target.x).attr('y2',d=>d.target.y); node.attr('cx',d=>d.x).attr('cy',d=>d.y); label.attr('x',d=>d.x+12).attr('y',d=>d.y+4); });
-              });
-            }
-            init();
-            </script>
-            """
             return render_template_string(tmpl, user=user, club=club, club_id=club_id, max_ts=int(max_ts))
-
-    @app.get("/clubs/<int:club_id>/graph.embed")
-    @app.get("/clubs/<int:club_id>/graph/embed")
-    def club_graph_embed(club_id):
-        """Panel içine iframe ile gömülebilen sade graf görünümü (yalnız admin-like)."""
-        user = current_user()
-        if not user:
-            return abort(401)
-        _, is_admin = user_membership(club_id, user["id"])
-        if not is_admin:
-            return abort(403)
-
-        with engine.begin() as con:
-            club = con.execute(text("SELECT name FROM clubs WHERE id=:c"), {"c": club_id}).mappings().first()
-        if not club: abort(404)
-
-        # Minimal, başlıksız embed
-        html = """
-        <!doctype html>
-        <meta charset="utf-8">
-        <style>
-          html,body{height:100%;margin:0;background:#0e0f13;color:#e7ebf7;font:14px system-ui}
-          #graph{position:absolute;inset:0}
-          .label{fill:#dfe7ff;font-size:11px;paint-order:stroke;stroke:#111;stroke-width:2;stroke-opacity:.4}
-        </style>
-        <div id="graph"></div>
-        <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
-        <script>
-          const wrap=document.getElementById('graph'); const W=wrap.clientWidth,H=wrap.clientHeight;
-          const svg=d3.select('#graph').append('svg').attr('width',W).attr('height',H).style('background','#0e0f13');
-          const container=svg.append('g'); const linkG=container.append('g').attr('stroke','#4ea2ff').attr('stroke-opacity',.9); const nodeG=container.append('g'); const labelG=container.append('g');
-          const zoom=d3.zoom().scaleExtent([.4,3]).on('zoom',(e)=>container.attr('transform',e.transform)); svg.call(zoom);
-          fetch("{{ url_for('club_graph_json', club_id=club_id) }}").then(r=>r.json()).then(data=>{
-            const nodes=data.nodes||[]; let edges=(data.edges||[]).map(e=>({...e}));
-            const byId=new Map(nodes.map(n=>[n.id,n])); edges=edges.map(l=>({source:byId.get(l.source),target:byId.get(l.target)})).filter(l=>l.source&&l.target);
-            const sim=d3.forceSimulation(nodes).force('link',d3.forceLink(edges).id(d=>d.id).distance(62)).force('charge',d3.forceManyBody().strength(-200)).force('center',d3.forceCenter(W/2,H/2));
-            const link=linkG.selectAll('line').data(edges).enter().append('line');
-            const node=nodeG.selectAll('circle').data(nodes).enter().append('circle').attr('r',10).attr('fill','#2f8dff').attr('stroke','#fff').attr('stroke-width',1);
-            const label=labelG.selectAll('text').data(nodes).enter().append('text').attr('class','label').text(d=>d.label);
-            sim.on('tick',()=>{ link.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y).attr('x2',d=>d.target.x).attr('y2',d=>d.target.y); node.attr('cx',d=>d.x).attr('cy',d=>d.y); label.attr('x',d=>d.x+12).attr('y',d=>d.y+4); });
-          });
-        </script>
-        """
-        return render_template_string(html, club_id=club_id)
 
     @app.get("/clubs/<int:club_id>/graph.json")
     def club_graph_json(club_id):
@@ -1039,7 +1229,7 @@ def create_app():
         _, is_admin = user_membership(club_id, user["id"])
         if not is_admin:
             return {"error": "forbidden"}, 403
-        until = request.args.get("until", type=float)
+        until = request.args.get("until", type=float)  # epoch
         include_pending = request.args.get("include_pending", default=0, type=int)
 
         with engine.begin() as con:
@@ -1071,7 +1261,7 @@ def create_app():
         pending_edges = [dict(r) for r in pending_rows] if include_pending else []
         return {"nodes": nodes, "edges": edges, "pending_edges": pending_edges}
 
-    # ===================== EVENT / BANNER / QR (aynı) =====================
+    # ===================== EVENT / BANNER / QR =====================
     def _parse_dt_local(dt_str):
         if not dt_str: return None
         try:
@@ -1087,6 +1277,7 @@ def create_app():
         if not is_admin_or_owner(club_id, user["id"]):
             flash("Bu kulüpte etkinlik oluşturma yetkin yok.", "danger")
             return redirect(url_for("club_dashboard", club_id=club_id))
+        # basit fallback form
         fallback = f"""
         <h2>Etkinlik Oluştur</h2>
         <form method="POST" enctype="multipart/form-data" action="{url_for('event_new_post', club_id=club_id)}" style="display:grid;gap:8px;max-width:480px">
@@ -1121,6 +1312,7 @@ def create_app():
         qr_secret = secrets.token_urlsafe(16)
         banner_url = None
 
+        # önce event kaydı
         with engine.begin() as con:
             if is_postgres(engine):
                 event_id = insert_with_returning(
@@ -1139,6 +1331,7 @@ def create_app():
                     params={"c": club_id, "t": title, "cat": category, "s": starts_at, "e": ends_at, "q": qr_secret, "u": user["id"], "now": now_ts()}
                 )
 
+        # banner yüklendiyse kaydet
         try:
             if "banner" in request.files and request.files["banner"].filename:
                 banner_url = _file_to_local(request.files["banner"], os.path.join(EVENT_DIR, str(event_id)), "banner")
@@ -1276,7 +1469,7 @@ def create_app():
         flash("Yoklamaya eklendin. Hoş geldin! 👋", "success")
         return redirect(url_for("event_analytics", event_id=e))
 
-    # ===================== KULÜP BANNER / LOGO =====================
+    # ===================== KULÜP BANNER / LOGO YÜKLEME =====================
     @app.post("/clubs/<int:club_id>/banner")
     def club_upload_banner(club_id):
         user = current_user()
@@ -1395,6 +1588,7 @@ def create_app():
         except Exception:
             if DEBUG_TRACE: traceback.print_exc()
 
+        # Fallback v2 endpoints
         try:
             if not sub:
                 me = requests.get(
@@ -1405,7 +1599,7 @@ def create_app():
                     mp = me.json()
                     sub = mp.get("id")
                     first = mp.get("localizedFirstName",""); last = mp.get("localizedLastName","")
-                    name = (first + last and f"{first} {last}") or name or "LinkedIn User"
+                    name = (first + " " + last).strip() or name or "LinkedIn User"
                     try:
                         pics = mp["profilePicture"]["displayImage~"]["elements"]
                         if pics:
@@ -1430,6 +1624,7 @@ def create_app():
             flash("LinkedIn kullanıcı bilgisi alınamadı. Lütfen tekrar deneyin.", "danger")
             return redirect(url_for("home"))
 
+        # Kullanıcıyı oluştur/güncelle
         with engine.begin() as con:
             row = con.execute(text("SELECT id FROM users WHERE linkedin_id=:lid"), {"lid": sub}).first()
             if row:
@@ -1451,6 +1646,7 @@ def create_app():
                         """, sql_pg="", params={"lid": sub, "n": name, "e": email}
                     )
 
+        # Avatar'ı indir ve local'e kaydet (başarısız olursa remote URL'yi yaz)
         avatar_url_final = None
         if avatar_remote:
             local_path = os.path.join(AVATAR_DIR, f"{uid}.jpg")
@@ -1473,11 +1669,12 @@ def create_app():
             return redirect(url_for("verify", next=nxt) if nxt else url_for("verify"))
         return redirect(nxt or url_for("home"))
 
-    # ===================== GLOBALS / VERIFY =====================
+    # ===================== GLOBALS =====================
     @app.context_processor
     def inject_globals():
         return {"HOST_URL": app.config["HOST_URL"]}
 
+    # ---------- Basit verify akışı (şablonların bağladığı) ----------
     @app.get("/verify")
     def verify():
         user = current_user()
@@ -1487,6 +1684,7 @@ def create_app():
 
     @app.post("/verify/start")
     def verify_start():
+        # Demo: e-posta gönderimini maketliyoruz
         email = (request.form.get("edu_email") or "").strip()
         if not email:
             flash("E-posta gerekli.", "danger"); return redirect(url_for("verify"))
