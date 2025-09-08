@@ -1170,37 +1170,62 @@ def create_app():
             flash(f"Banner yüklenemedi: {e}", "danger")
         return redirect(url_for("event_analytics", event_id=event_id))
 
-    @app.get("/events/<int:event_id>/live")
-    def event_live(event_id):
-        user = current_user()
-        if not user: return redirect(url_for("li_login", next=request.url))
-        with engine.begin() as con:
-            ev = con.execute(text("SELECT * FROM events WHERE id=:id"), {"id": event_id}).mappings().first()
-            if not ev: abort(404)
-            club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": ev["club_id"]}).mappings().first()
-            if not club: abort(404)
+# Etkinlik Analiz sayfası
+@app.get("/events/<int:event_id>/analytics")
+@login_required
+def event_analytics(event_id):
+    user = current_user()
+    if not user:
+        return redirect(url_for("home"))
+    
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            # Etkinlik bilgilerini çek
+            cur.execute("SELECT * FROM events WHERE id = %s", (event_id,))
+            event = cur.fetchone()
+            
+            if not event:
+                abort(404)
+            
+            # Kulüp bilgilerini çek
+            cur.execute("SELECT * FROM clubs WHERE id = %s", (event["club_id"],))
+            club = cur.fetchone()
 
-        if not (is_admin_or_owner(ev["club_id"], user["id"]) or ev["created_by"] == user["id"]):
-            flash("Bu etkinliğin canlı ekranına erişimin yok.", "danger")
-            return redirect(url_for("event_analytics", event_id=event_id))
+            # Kullanıcının kulüpte admin/owner olup olmadığını kontrol et
+            cur.execute("""
+                SELECT 1 FROM club_members
+                WHERE club_id = %s AND user_id = %s AND role IN ('owner', 'admin')
+            """, (club["id"], user["id"]))
+            if not cur.fetchone():
+                flash("Bu etkinliğin analitik sayfasını görme yetkiniz yok.", "danger")
+                return redirect(url_for("home"))
 
-        with engine.begin() as con:
-            cnt = con.execute(text("SELECT COUNT(*) FROM checkins WHERE event_id=:e"), {"e": event_id}).scalar() or 0
-        join_url = app.config["HOST_URL"].rstrip("/") + url_for("join") + f"?e={event_id}&q={quote(ev['qr_secret'])}"
+            # Katılımcıları ve diğer analiz verilerini çek
+            cur.execute("""
+                SELECT u.name, u.avatar_url, u.edu_email, c.checkin_time
+                FROM checkins c JOIN users u ON u.id = c.user_id
+                WHERE c.event_id = %s
+                ORDER BY c.checkin_time ASC
+            """, (event_id,))
+            attendees = cur.fetchall()
 
-        fallback = f"""
-        <div style="position:relative;border-radius:16px;overflow:hidden;border:1px solid #222;margin-bottom:12px">
-          <div style="height:220px;background:#222 url('{ev.get('banner_url') or ''}') center/cover no-repeat"></div>
-          <div style="padding:16px"><h2 style="margin:0">{ev['title']}</h2></div>
-        </div>
-        <p>Toplam katılımcı: <b>{cnt}</b></p>
-        <img src="{url_for('event_qr_png', event_id=event_id)}" alt="QR" style="width:260px;height:260px;border:8px solid #fff;border-radius:12px" />
-        <p style="opacity:.7">Katılım linki: <a href="{join_url}">{join_url}</a></p>
-        """
-        return try_render("event_live_qr.html", user=user, event=ev, club=club,
-                          join_url=join_url, count=cnt,
-                          page_title="Canlı Yoklama Ekranı", fallback_html=fallback)
-
+            total_att = len(attendees)
+            member_count = 0 # Bu kulüpteki toplam üye sayısı
+            # total_att'e göre edu_verified_count ve diğer metrikleri hesaplayın.
+            
+    # Şablonu render et
+    return render_template(
+        "event_analytics.html",
+        event=event,
+        club=club,
+        attendees=attendees,
+        total_att=total_att,
+        member_count=member_count,
+        edu_verified_count=sum(1 for a in attendees if a['edu_email']),
+        continued=0, # Bu ve diğer metrikleri uygun şekilde hesaplayın
+        cont_rate=0,
+        new_edges_after=0,
+    )
     @app.get("/events/<int:event_id>/qr.png")
     def event_qr_png(event_id):
         user = current_user()
