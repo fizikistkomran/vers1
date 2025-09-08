@@ -1691,12 +1691,15 @@ def club_graph_json(club_id):
         return redirect(url_for("home"))
         
         
-     from connect_routes import bp as connections_bp
-     app.register_blueprint(connections_bp)
-        
  
 
     return app
+    
+# === Connections blueprint ===
+from connect_routes import bp as connections_bp
+app.register_blueprint(connections_bp)
+# === /Connections blueprint ===
+
 
 app = create_app()
 
