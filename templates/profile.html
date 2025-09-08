@@ -1,41 +1,48 @@
 {% extends "base.html" %}
-{% block title %}Profilim · enfekte.co{% endblock %}
+{% block title %}{{ profile_user.name }}'ın Profili · enfekte.co{% endblock %}
 {% block content %}
-
-<h2 class="section-title">Profilim</h2>
-
-<div class="list" style="margin-bottom:18px">
-  <div class="row">
-    <span class="avatar"></span>
-    <div>
-      <div style="font-weight:800;font-size:22px">{{ user.name }}</div>
-      {% if user.edu_email %}
-        <div class="sub">EDU mail: {{ user.edu_email }}</div>
-      {% else %}
-        <div class="sub">EDU doğrulaması yok · <a class="link" href="{{ url_for('verify') }}">Doğrula</a></div>
-      {% endif %}
-    </div>
+<div class="card" style="display:flex; gap:20px; align-items:flex-start; flex-wrap:wrap;">
+  <div style="flex-shrink:0;">
+    <img
+      src="{{ profile_user.avatar_url or '/static/avatar-placeholder.png' }}"
+      alt="{{ profile_user.name }}"
+      style="width:120px; height:120px; border-radius:50%; object-fit:cover; border:2px solid var(--glass-stroke);"
+    />
+  </div>
+  <div>
+    <h2 style="margin-top:0;">{{ profile_user.name }}</h2>
+    <div class="muted">{{ profile_user.email }}</div>
+    {% if profile_user.edu_email %}
+    <div class="pill green" style="margin-top:8px;">EDU Doğrulaması Yapıldı</div>
+    {% endif %}
+    {% if user_id and profile_user.id != user_id %}
+        {% if connection_status == 'none' %}
+            <form method="post" action="{{ url_for('connect_request', uid=profile_user.id) }}" style="margin-top:12px;">
+                <button type="submit" class="btn-badge">Bağlantı İsteği Gönder</button>
+            </form>
+        {% elif connection_status == 'pending_sent' %}
+            <span class="pill" style="margin-top:12px;">İstek Gönderildi</span>
+        {% elif connection_status == 'pending_received' %}
+            <span class="pill blue" style="margin-top:12px;">Bağlantı İsteği Geldi</span>
+        {% elif connection_status == 'connected' %}
+            <span class="pill green" style="margin-top:12px;">Bağlısınız</span>
+        {% endif %}
+    {% endif %}
   </div>
 </div>
 
-<h2 class="section-title">Üyelikler</h2>
-{% if memberships %}
-  <div class="list">
-    {% for m in memberships %}
-      <div class="row">
-        <div style="font-weight:700">{{ m.name }}</div>
-        <span class="pill">{{ m.role }}</span>
-        <a class="link" href="{{ url_for('club_dashboard', club_id=m.id) }}">kulüp paneli</a>
-      </div>
-    {% endfor %}
-  </div>
-{% else %}
-  <div class="empty list">Herhangi bir kulüpte üyeliğin yok.</div>
+{% if user_clubs %}
+<h3 class="section-title">Katıldığı Kulüpler</h3>
+<div class="list">
+  {% for club in user_clubs %}
+  <a href="{{ url_for('club_dashboard', club_id=club.id) }}" class="row card small">
+    <div style="flex:1;">
+      <div style="font-size:18px; font-weight:bold;">{{ club.name }}</div>
+      <div class="meta">Rol: {{ club.role }}</div>
+    </div>
+  </a>
+  {% endfor %}
+</div>
 {% endif %}
 
-<div style="margin-top:18px">
-  <a class="btn-badge" href="{{ url_for('logout') }}">çıkış yap</a>
-</div>
-
 {% endblock %}
-
