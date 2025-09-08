@@ -1,40 +1,72 @@
 # connect_routes.py
-import os, time
+import os, re, time
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from flask import Blueprint, request, redirect, url_for, flash, abort, session
 
 bp = Blueprint("connections", __name__)
 
-# ---------- DB helpers (psycopg2) ----------
+# ---------- DSN / DB helpers ----------
+def _clean_dsn(url: str) -> str:
+    """
+    SQLAlchemy tarzı DSN'leri psycopg2 için temizler.
+    - postgresql+psycopg2://  -> postgresql://
+    - postgres://             -> postgresql://
+    - sslmode parametresini garanti eder (değer yoksa =require ekler)
+    """
+    u = (url or "").strip()
+    if not u:
+        return u
+
+    # Şema düzeltme
+    if u.startswith("postgresql+psycopg2://"):
+        u = "postgresql://" + u.split("postgresql+psycopg2://", 1)[1]
+    elif u.startswith("postgres://"):
+        u = "postgresql://" + u[len("postgres://"):]
+
+    # Query düzenleme (sslmode kontrolü)
+    parts = urlsplit(u)
+    q = dict(parse_qsl(parts.query, keep_blank_values=True))
+
+    if "sslmode" not in q or not q.get("sslmode"):
+        q["sslmode"] = "require"
+
+    new_query = urlencode(q, doseq=True)
+    cleaned = urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+    return cleaned
+
 def _get_db_params():
     """
-    Railway genelde DATABASE_URL verir.
-    Yoksa manuel env değişkenleri veya app.py’de kullandığın değerlerle doldur.
+    Railway genelde DATABASE_URL sağlar. Onu kullan, yoksa tek tek env değişkenlerine düş.
     """
-    url = os.getenv("DATABASE_URL")
-    if url:
-        # psycopg2 DSN formatını kabul eder
-        return {"dsn": url}
-    # Yedek: manuel param (app.py’de olanları buraya da yansıt)
+    raw = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or ""
+    if raw:
+        return {"dsn": _clean_dsn(raw)}
+    # Yedek env değişkenleri
     return {
-        "dbname": os.getenv("PGDATABASE", "railway"),
-        "user": os.getenv("PGUSER", "postgres"),
-        "password": os.getenv("PGPASSWORD", "postgres"),
-        "host": os.getenv("PGHOST", "localhost"),
-        "port": int(os.getenv("PGPORT", "5432")),
+        "dbname": os.getenv("PGDATABASE", os.getenv("DATABASE_NAME", "railway")),
+        "user": os.getenv("PGUSER", os.getenv("DATABASE_USER", "postgres")),
+        "password": os.getenv("PGPASSWORD", os.getenv("DATABASE_PASSWORD", "")),
+        "host": os.getenv("PGHOST", os.getenv("DATABASE_HOST", "localhost")),
+        "port": int(os.getenv("PGPORT", os.getenv("DATABASE_PORT", "5432"))),
+        "sslmode": os.getenv("PGSSLMODE", "require"),
     }
 
 def get_db_connection():
     params = _get_db_params()
     if "dsn" in params:
+        # DSN string ile bağlan
         return psycopg2.connect(params["dsn"], cursor_factory=RealDictCursor)
+    # Parametre bazlı bağlan
     return psycopg2.connect(
         dbname=params["dbname"],
         user=params["user"],
         password=params["password"],
         host=params["host"],
         port=params["port"],
+        sslmode=params.get("sslmode", "require"),
         cursor_factory=RealDictCursor,
     )
 
@@ -47,8 +79,7 @@ def canonical_pair(a: int, b: int):
 # ---------- Schema bootstrap ----------
 def ensure_graph_table():
     """
-    PostgreSQL ile uyumlu DDL.
-    Railway ilk istekte tabloyu oluşturur; varsa zarar vermez.
+    PostgreSQL uyumlu tablo. Varsa dokunmaz; yoksa oluşturur.
     """
     ddl = """
     CREATE TABLE IF NOT EXISTS graph_edges(
@@ -74,20 +105,19 @@ def is_member(club_id: int, user_id: int) -> bool:
             c.execute("""
                 SELECT 1 FROM club_members WHERE club_id = %s AND user_id = %s
             """, (club_id, user_id))
-            row = c.fetchone()
-            return bool(row)
+            return c.fetchone() is not None
 
-# İstersen admin-like kısıt koyarsın; şimdilik sadece üyelik yeter
+# İstersen admin-like gerektir; şimdilik kulüp üyesi olmak yeterli
 def can_interact(club_id: int, user_id: int) -> bool:
     return is_member(club_id, user_id)
 
-# ---------- Routes ----------
+# ---------- Hooks ----------
 @bp.before_app_request
 def _boot_if_needed():
-    # Her request’te hızlı kontrol; tablo yoksa oluştur.
-    # (CREATE IF NOT EXISTS cheap’tir; sorun olmaz)
+    # CREATE TABLE IF NOT EXISTS çok hafif bir çağrı; her request'te güvenli.
     ensure_graph_table()
 
+# ---------- Routes ----------
 @bp.post("/clubs/<int:club_id>/connect/request")
 def connect_request(club_id):
     uid = session.get("uid") or session.get("user_id")
