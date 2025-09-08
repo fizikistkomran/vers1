@@ -1104,11 +1104,23 @@ def club_graph(club_id):
         return redirect(url_for("club_dashboard", club_id=club_id))
 
     with engine.begin() as con:
-        club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": club_id}).mappings().first()
-        max_ts = con.execute(text("SELECT MAX(created_at) FROM graph_edges WHERE club_id=:c"), {"c": club_id}).scalar() or now_ts()
+        club = con.execute(
+            text("SELECT * FROM clubs WHERE id=:c"),
+            {"c": club_id}
+        ).mappings().first()
+        max_ts = con.execute(
+            text("SELECT MAX(created_at) FROM graph_edges WHERE club_id=:c"),
+            {"c": club_id}
+        ).scalar() or now_ts()
 
     try:
-        return render_template("club_graph.html", user=user, club=club, club_id=club_id, max_ts=int(max_ts))
+        return render_template(
+            "club_graph.html",
+            user=user,
+            club=club,
+            club_id=club_id,
+            max_ts=int(max_ts),
+        )
     except TemplateNotFound:
         tmpl = """
         <!doctype html><meta charset="utf-8"><title>{{ club.name }} · Ağ Haritası</title>
@@ -1135,23 +1147,34 @@ def club_graph(club_id):
         init();
         </script>
         """
-        return render_template_string(tmpl, user=user, club=club, club_id=club_id, max_ts=int(max_ts))
+        return render_template_string(
+            tmpl,
+            user=user,
+            club=club,
+            club_id=club_id,
+            max_ts=int(max_ts),
+        )
 
 
 @app.get("/clubs/<int:club_id>/graph.embed")
 @app.get("/clubs/<int:club_id>/graph/embed")
 def club_graph_embed(club_id):
-    """Panel içine iframe ile gömülen sade görünüm — artık ÜYE’lere de açık."""
+    """Panel içine iframe ile gömülen sade görünüm — ÜYE’lere açık."""
     user = current_user()
     if not user:
         return abort(401)
+
     is_member, _ = user_membership(club_id, user["id"])
     if not is_member:
         return abort(403)
 
     with engine.begin() as con:
-        club = con.execute(text("SELECT name FROM clubs WHERE id=:c"), {"c": club_id}).mappings().first()
-    if not club: abort(404)
+        club = con.execute(
+            text("SELECT name FROM clubs WHERE id=:c"),
+            {"c": club_id}
+        ).mappings().first()
+    if not club:
+        abort(404)
 
     html = """
     <!doctype html>
@@ -1185,7 +1208,8 @@ def club_graph_embed(club_id):
 @app.get("/clubs/<int:club_id>/graph.json")
 def club_graph_json(club_id):
     user = current_user()
-    if not user: return {"error": "auth"}, 401
+    if not user:
+        return {"error": "auth"}, 401
 
     # Üyelik yeterli
     is_member, _ = user_membership(club_id, user["id"])
@@ -1196,28 +1220,40 @@ def club_graph_json(club_id):
     include_pending = request.args.get("include_pending", default=0, type=int)
 
     with engine.begin() as con:
-        nodes_rows = con.execute(text("""
-          SELECT u.id AS id, u.name AS label, u.avatar_url AS avatar
-          FROM club_members m JOIN users u ON u.id=m.user_id
-          WHERE m.club_id=:c
-        """), {"c": club_id}).mappings().all()
+        nodes_rows = con.execute(
+            text("""
+                SELECT u.id AS id, u.name AS label, u.avatar_url AS avatar
+                FROM club_members m
+                JOIN users u ON u.id = m.user_id
+                WHERE m.club_id = :c
+            """),
+            {"c": club_id},
+        ).mappings().all()
+
         params = {"c": club_id}
         time_clause = " AND created_at <= :t" if until else ""
-        if until: params["t"] = until
+        if until:
+            params["t"] = until
 
-        edges_rows = con.execute(text(f"""
-          SELECT src_user_id AS source, dst_user_id AS target
-          FROM graph_edges 
-          WHERE club_id=:c AND status='accepted' {time_clause}
-        """), params).mappings().all()
+        edges_rows = con.execute(
+            text(f"""
+                SELECT src_user_id AS source, dst_user_id AS target
+                FROM graph_edges
+                WHERE club_id = :c AND status = 'accepted' {time_clause}
+            """),
+            params,
+        ).mappings().all()
 
         pending_rows = []
         if include_pending:
-            pending_rows = con.execute(text(f"""
-              SELECT src_user_id AS source, dst_user_id AS target
-              FROM graph_edges 
-              WHERE club_id=:c AND status='pending' {time_clause}
-            """), params).mappings().all()
+            pending_rows = con.execute(
+                text(f"""
+                    SELECT src_user_id AS source, dst_user_id AS target
+                    FROM graph_edges
+                    WHERE club_id = :c AND status = 'pending' {time_clause}
+                """),
+                params,
+            ).mappings().all()
 
     nodes = [dict(r) for r in nodes_rows]
     edges = [dict(r) for r in edges_rows]
@@ -1667,4 +1703,5 @@ app = create_app()
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
 
