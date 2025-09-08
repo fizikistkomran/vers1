@@ -592,8 +592,9 @@ def create_app():
         return render_template("panels.html", user=user, admin_clubs=admin_clubs)
 
     # ===================== KULÜP PANELİ =====================
-    @app.get("/clubs/<int:club_id>")
-    def club_dashboard(club_id):
+    # ===================== KULÜP PANELİ =====================
+@app.get("/clubs/<int:club_id>")
+def club_dashboard(club_id):
     user = current_user()
     if not user:
         return redirect(url_for("home"))
@@ -674,44 +675,7 @@ def create_app():
             <td>{btn}</td>
           </tr>
         """)
-
-    analytics_link = f"<a href='{url_for('club_analytics', club_id=club_id)}'>Analitik</a>" if is_admin else ""
-    graph_embed = (f"<iframe src='{url_for('club_graph', club_id=club_id)}' "
-                   f"style='width:100%;height:560px;border:1px solid #333;border-radius:12px;background:#0e0f13' "
-                   f"loading='lazy'></iframe>") if is_member else "<div class='empty list'>Grafiği görmek için üye ol.</div>"
-
-    fallback = f"""
-    <div style="position:relative;border-radius:16px;overflow:hidden;border:1px solid #222">
-      <div style="height:180px;background:#222 url('{club.get('banner_url') or ''}') center/cover no-repeat"></div>
-      <div style="padding:16px">
-        <h2 style="margin:0">{club['name']}</h2>
-        <div style="opacity:.7">Kulüp #{club['id']}</div>
-      </div>
-    </div>
-
-    <div style="margin-top:16px;display:flex;gap:24px;flex-wrap:wrap">
-      <a href="{url_for('club_members', club_id=club_id)}">Üyeler & Roller</a>
-      <a href="{url_for('club_graph', club_id=club_id)}">Grafik (tam ekran)</a>
-      {analytics_link}
-    </div>
-
-    <h3 style="margin-top:16px">Topluluk Ağı</h3>
-    <p class="muted">Bağ oluşturmak için listeden “Bağlan” de; karşı taraf kabul edince grafikte kenar oluşur.</p>
-    {graph_embed}
-
-    <h3 style="margin-top:18px">Üyeler</h3>
-    <table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse">
-      <tr><th>Üye</th><th>Rol</th><th>Bağlantı</th></tr>
-      {''.join(connect_rows)}
-    </table>
-    """
-
-    return try_render("club_dashboard.html",
-                      user=user, club=club, members=members,
-                      meetings=meetings, events=events,
-                      owner=owner_like, is_member=is_member,
-                      page_title=f"{club['name']}", fallback_html=fallback)
-
+    # ... devamı ...
     # ===================== ÜYELER & ROLLER =====================
     @app.get("/clubs/<int:club_id>/members")
     def club_members(club_id):
