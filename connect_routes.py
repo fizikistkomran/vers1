@@ -6,12 +6,14 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 from flask import Blueprint, request, redirect, url_for, flash, abort, session
 from sqlalchemy import text
-from app import engine, current_user, canonical_pair, now_ts, is_member, can_interact
+from .db import engine, now_ts, canonical_pair
+from .app import current_user, user_membership, is_admin_or_owner, get_edge_status, ensure_member
 
 bp = Blueprint("connections", __name__)
 
-# NOT: Artık get_db_connection() veya ensure_graph_table() gibi fonksiyonlar burada yok.
-# Onlar app.py'de tanımlandı ve global olarak kullanılıyor.
+def can_interact(club_id, user_id):
+    is_member, _ = user_membership(club_id, user_id)
+    return is_member
 
 # ---------- Routes ----------
 @bp.post("/clubs/<int:club_id>/connect/request")
