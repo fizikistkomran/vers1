@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Profilimi Düzenle · enfekte.co{% endblock %}
+{% block content %}
+
+<h2 class="section-title">Profilimi Düzenle</h2>
+
+<form method="post" action="{{ url_for('profile_edit_post') }}" enctype="multipart/form-data" class="list" style="max-width:520px">
+  <div class="row" style="flex-wrap:wrap">
+    <label style="min-width:140px">Ad Soyad</label>
+    <input required name="name" value="{{ (user.name or '') }}"
+           placeholder="Ad Soyad"
+           style="flex:1; padding:10px; border-radius:10px; border:1px solid var(--glass-stroke); background:rgba(255,255,255,.06); color:#fff" />
+  </div>
+
+  <div class="row" style="flex-wrap:wrap">
+    <label style="min-width:140px">Avatar</label>
+    <input type="file" name="avatar" accept="image/*" />
+  </div>
+
+  <div class="row" style="align-items:flex-start; gap:16px">
+    <div class="meta">Mevcut</div>
+    <img src="{{ user.avatar_url or '/static/avatar-placeholder.png' }}" alt="avatar"
+         style="width:72px;height:72px;border-radius:50%;object-fit:cover;border:1px solid var(--glass-stroke)">
+  </div>
+
+  <div class="row">
+    <button class="btn-badge" type="submit">Kaydet</button>
+    <a class="btn-badge" style="opacity:.8" href="{{ url_for('profile') }}">Vazgeç</a>
+  </div>
+</form>
+
+{% endblock %}
+
