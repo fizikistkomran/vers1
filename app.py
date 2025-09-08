@@ -374,8 +374,7 @@ def create_app():
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
     app.config["SESSION_COOKIE_SECURE"]   = False
     app.config["MAX_CONTENT_LENGTH"]      = 12 * 1024 * 1024  # 12MB
-    from connect_routes import bp as connections_bp
-    app.register_blueprint(connections_bp)
+   
 
     # --- DB ---
     # URL'i normalize et (Railway/SQLAlchemy uyumu)
@@ -1092,174 +1091,138 @@ def create_app():
                           page_title="Kulüp Analitiği", fallback_html=fallback)
 
     # ===================== GRAF (D3) + TIMELAPSE =====================
-    @app.get("/clubs/<int:club_id>/graph")
-    def club_graph(club_id):
-        user = current_user()
-        if not user:
-            return redirect(url_for("home"))
-        _, is_admin = user_membership(club_id, user["id"])
-        if not is_admin:
-            flash("Grafiği sadece admin-like profiller görebilir.", "warning")
-            return redirect(url_for("club_dashboard", club_id=club_id))
+@app.get("/clubs/<int:club_id>/graph")
+def club_graph(club_id):
+    user = current_user()
+    if not user:
+        return redirect(url_for("home"))
 
-        with engine.begin() as con:
-            club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": club_id}).mappings().first()
-            max_ts = con.execute(text("SELECT MAX(created_at) FROM graph_edges WHERE club_id=:c"), {"c": club_id}).scalar() or now_ts()
+    # Üyelik kontrolü (admin zorunlu değil)
+    is_member, is_admin = user_membership(club_id, user["id"])
+    if not is_member:
+        flash("Grafiği görmek için kulüp üyesi olmalısın.", "warning")
+        return redirect(url_for("club_dashboard", club_id=club_id))
 
-        # f-string KULLANMADAN Jinja ile render edilecek fallback HTML/JS
+    with engine.begin() as con:
+        club = con.execute(text("SELECT * FROM clubs WHERE id=:c"), {"c": club_id}).mappings().first()
+        max_ts = con.execute(text("SELECT MAX(created_at) FROM graph_edges WHERE club_id=:c"), {"c": club_id}).scalar() or now_ts()
+
+    try:
+        return render_template("club_graph.html", user=user, club=club, club_id=club_id, max_ts=int(max_ts))
+    except TemplateNotFound:
         tmpl = """
-        <!doctype html>
-        <meta charset="utf-8">
-        <title>{{ club.name }} · Ağ Haritası</title>
-        <div style="padding:12px;font-family:system-ui;color:#eee;background:#111">
-          <h2 style="margin:8px 0 12px">{{ club.name }} · Ağ Haritası (beta)</h2>
-          <div style="margin-bottom:8px; display:flex; gap:10px; align-items:center">
-            <label><input id="togglePending" type="checkbox"/> bekleyen istekleri de göster</label>
-          </div>
-          <div id="graph" style="width:100%;height:520px;border:1px solid #222;border-radius:12px"></div>
-          <div style="margin-top:8px">
-            <input id="timeRange" type="range" min="0" max="{{ max_ts|int }}" value="{{ max_ts|int }}" style="width:100%" />
-            <div style="display:flex;justify-content:space-between;font-size:12px;opacity:.7">
-              <span>başlangıç</span><span>şimdi</span>
-            </div>
-          </div>
-        </div>
+        <!doctype html><meta charset="utf-8"><title>{{ club.name }} · Ağ Haritası</title>
+        <div id="graph" style="height:520px"></div>
         <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
         <script>
-        const clubId = {{ club_id }};
-        const graphEl = document.getElementById('graph');
-        const slider  = document.getElementById('timeRange');
-        const togglePending = document.getElementById('togglePending');
-
-        let svg, width, height, simulation, link, node, label, pendingLink;
-
+        const clubId={{ club_id }};
+        const graphEl=document.getElementById('graph');
+        let svg,w=graphEl.clientWidth,h=graphEl.clientHeight,sim,links,nodes;
         function init(){
-          width = graphEl.clientWidth;
-          height = graphEl.clientHeight;
-          svg = d3.select('#graph').append('svg')
-            .attr('width', width).attr('height', height)
-            .style('background','#111');
-          link = svg.append('g').attr('stroke','#6aa0ff').attr('stroke-opacity',0.9).selectAll('line');
-          pendingLink = svg.append('g').attr('stroke','#888').attr('stroke-opacity',0.4).attr('stroke-dasharray','4 4').selectAll('line');
-          node = svg.append('g').attr('stroke','#fff').attr('stroke-width',1).selectAll('circle');
-          label= svg.append('g').selectAll('text');
-          simulation = d3.forceSimulation()
-            .force('link', d3.forceLink().id(d=>d.id).distance(60))
-            .force('charge', d3.forceManyBody().strength(-180))
-            .force('center', d3.forceCenter(width/2, height/2));
-          fetchAndRender();
+          svg=d3.select('#graph').append('svg').attr('width',w).attr('height',h).style('background','#111');
+          const g=svg.append('g'); const linkG=g.append('g'); const nodeG=g.append('g'); const labelG=g.append('g');
+          fetch(`/clubs/${clubId}/graph.json`).then(r=>r.json()).then(data=>{
+            nodes=data.nodes; links=data.edges.map(e=>({...e}));
+            const byId=new Map(nodes.map(n=>[n.id,n]));
+            links=links.map(l=>({source:byId.get(l.source),target:byId.get(l.target)})).filter(l=>l.source&&l.target);
+            sim=d3.forceSimulation(nodes).force('link',d3.forceLink(links).id(d=>d.id).distance(62)).force('charge',d3.forceManyBody().strength(-200)).force('center',d3.forceCenter(w/2,h/2));
+            const link=linkG.selectAll('line').data(links).enter().append('line').attr('stroke','#6aa0ff').attr('stroke-opacity',.9);
+            const node=nodeG.selectAll('circle').data(nodes).enter().append('circle').attr('r',10).attr('fill','#2e8bfa');
+            const label=labelG.selectAll('text').data(nodes).enter().append('text').text(d=>d.label).attr('fill','#ddd').attr('font-size',11);
+            sim.on('tick',()=>{ link.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y).attr('x2',d=>d.target.x).attr('y2',d=>d.target.y); node.attr('cx',d=>d.x).attr('cy',d=>d.y); label.attr('x',d=>d.x+12).attr('y',d=>d.y+4); });
+          });
         }
-
-        function fetchAndRender(){
-          const until = slider.value;
-          const includePending = togglePending.checked ? 1 : 0;
-          fetch(`/clubs/${clubId}/graph.json?until=${until}&include_pending=${includePending}`)
-            .then(r=>r.json())
-            .then(data=>{
-              link = link.data(data.edges, d=>d.source+'-'+d.target);
-              link.exit().remove();
-              link = link.enter().append('line').merge(link);
-
-              pendingLink = pendingLink.data(data.pending_edges || [], d=>d.source+'-'+d.target);
-              pendingLink.exit().remove();
-              pendingLink = pendingLink.enter().append('line').merge(pendingLink);
-
-              node = node.data(data.nodes, d=>d.id);
-              node.exit().remove();
-              node = node.enter().append('circle')
-                .attr('r', 10)
-                .attr('fill', '#2e8bfa')
-                .call(drag(simulation))
-                .merge(node);
-
-              label = label.data(data.nodes, d=>d.id);
-              label.exit().remove();
-              label = label.enter().append('text')
-                .text(d=>d.label)
-                .attr('fill','#ddd')
-                .attr('font-size',11)
-                .merge(label);
-
-              simulation.nodes(data.nodes).on('tick', ticked);
-              const allLinks = [...data.edges, ...(data.pending_edges||[])];
-              simulation.force('link').links(allLinks);
-              simulation.alpha(0.8).restart();
-            });
-        }
-
-        function ticked(){
-          link.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y)
-              .attr('x2', d=>d.target.x).attr('y2', d=>d.target.y);
-          pendingLink.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y)
-              .attr('x2', d=>d.target.x).attr('y2', d=>d.target.y);
-          node.attr('cx', d=>d.x).attr('cy', d=>d.y);
-          label.attr('x', d=>d.x+12).attr('y', d=>d.y+4);
-        }
-
-        function drag(sim){
-          function dragstarted(event, d){
-            if (!event.active) sim.alphaTarget(0.3).restart();
-            d.fx = d.x; d.fy = d.y;
-          }
-          function dragged(event,d){ d.fx = event.x; d.fy = event.y; }
-          function dragended(event,d){
-            if (!event.active) sim.alphaTarget(0);
-            d.fx = null; d.fy = null;
-          }
-          return d3.drag().on('start',dragstarted).on('drag',dragged).on('end',dragended);
-        }
-
-        // basit debounce
-        let t=null;
-        slider.addEventListener('input', ()=>{ clearTimeout(t); t=setTimeout(fetchAndRender,180); });
-        togglePending.addEventListener('change', fetchAndRender);
-        window.addEventListener('resize', ()=>{ d3.select('#graph svg').remove(); init(); });
         init();
         </script>
         """
-        try:
-            return render_template("club_graph.html", user=user, club=club, club_id=club_id, max_ts=int(max_ts))
-        except TemplateNotFound:
-            return render_template_string(tmpl, user=user, club=club, club_id=club_id, max_ts=int(max_ts))
+        return render_template_string(tmpl, user=user, club=club, club_id=club_id, max_ts=int(max_ts))
 
-    @app.get("/clubs/<int:club_id>/graph.json")
-    def club_graph_json(club_id):
-        user = current_user()
-        if not user: return {"error": "auth"}, 401
-        _, is_admin = user_membership(club_id, user["id"])
-        if not is_admin:
-            return {"error": "forbidden"}, 403
-        until = request.args.get("until", type=float)  # epoch
-        include_pending = request.args.get("include_pending", default=0, type=int)
 
-        with engine.begin() as con:
-            nodes_rows = con.execute(text("""
-              SELECT u.id AS id, u.name AS label, u.avatar_url AS avatar
-              FROM club_members m JOIN users u ON u.id=m.user_id
-              WHERE m.club_id=:c
-            """), {"c": club_id}).mappings().all()
-            params = {"c": club_id}
-            time_clause = " AND created_at <= :t" if until else ""
-            if until:
-                params["t"] = until
-            edges_rows = con.execute(text(f"""
+@app.get("/clubs/<int:club_id>/graph.embed")
+@app.get("/clubs/<int:club_id>/graph/embed")
+def club_graph_embed(club_id):
+    """Panel içine iframe ile gömülen sade görünüm — artık ÜYE’lere de açık."""
+    user = current_user()
+    if not user:
+        return abort(401)
+    is_member, _ = user_membership(club_id, user["id"])
+    if not is_member:
+        return abort(403)
+
+    with engine.begin() as con:
+        club = con.execute(text("SELECT name FROM clubs WHERE id=:c"), {"c": club_id}).mappings().first()
+    if not club: abort(404)
+
+    html = """
+    <!doctype html>
+    <meta charset="utf-8">
+    <style>
+      html,body{height:100%;margin:0;background:#0e0f13;color:#e7ebf7;font:14px system-ui}
+      #graph{position:absolute;inset:0}
+      .label{fill:#dfe7ff;font-size:11px;paint-order:stroke;stroke:#111;stroke-width:2;stroke-opacity:.4}
+    </style>
+    <div id="graph"></div>
+    <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+    <script>
+      const wrap=document.getElementById('graph'); const W=wrap.clientWidth,H=wrap.clientHeight;
+      const svg=d3.select('#graph').append('svg').attr('width',W).attr('height',H).style('background','#0e0f13');
+      const container=svg.append('g'); const linkG=container.append('g').attr('stroke','#4ea2ff').attr('stroke-opacity',.9); const nodeG=container.append('g'); const labelG=container.append('g');
+      const zoom=d3.zoom().scaleExtent([.4,3]).on('zoom',(e)=>container.attr('transform',e.transform)); svg.call(zoom);
+      fetch("{{ url_for('club_graph_json', club_id=club_id) }}").then(r=>r.json()).then(data=>{
+        const nodes=data.nodes||[]; let edges=(data.edges||[]).map(e=>({...e}));
+        const byId=new Map(nodes.map(n=>[n.id,n])); edges=edges.map(l=>({source:byId.get(l.source),target:byId.get(l.target)})).filter(l=>l.source&&l.target);
+        const sim=d3.forceSimulation(nodes).force('link',d3.forceLink(edges).id(d=>d.id).distance(62)).force('charge',d3.forceManyBody().strength(-200)).force('center',d3.forceCenter(W/2,H/2));
+        const link=linkG.selectAll('line').data(edges).enter().append('line');
+        const node=nodeG.selectAll('circle').data(nodes).enter().append('circle').attr('r',10).attr('fill','#2f8dff').attr('stroke','#fff').attr('stroke-width',1);
+        const label=labelG.selectAll('text').data(nodes).enter().append('text').attr('class','label').text(d=>d.label);
+        sim.on('tick',()=>{ link.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y).attr('x2',d=>d.target.x).attr('y2',d=>d.target.y); node.attr('cx',d=>d.x).attr('cy',d=>d.y); label.attr('x',d=>d.x+12).attr('y',d=>d.y+4); });
+      });
+    </script>
+    """
+    return render_template_string(html, club_id=club_id)
+
+
+@app.get("/clubs/<int:club_id>/graph.json")
+def club_graph_json(club_id):
+    user = current_user()
+    if not user: return {"error": "auth"}, 401
+
+    # Üyelik yeterli
+    is_member, _ = user_membership(club_id, user["id"])
+    if not is_member:
+        return {"error": "forbidden"}, 403
+
+    until = request.args.get("until", type=float)
+    include_pending = request.args.get("include_pending", default=0, type=int)
+
+    with engine.begin() as con:
+        nodes_rows = con.execute(text("""
+          SELECT u.id AS id, u.name AS label, u.avatar_url AS avatar
+          FROM club_members m JOIN users u ON u.id=m.user_id
+          WHERE m.club_id=:c
+        """), {"c": club_id}).mappings().all()
+        params = {"c": club_id}
+        time_clause = " AND created_at <= :t" if until else ""
+        if until: params["t"] = until
+
+        edges_rows = con.execute(text(f"""
+          SELECT src_user_id AS source, dst_user_id AS target
+          FROM graph_edges 
+          WHERE club_id=:c AND status='accepted' {time_clause}
+        """), params).mappings().all()
+
+        pending_rows = []
+        if include_pending:
+            pending_rows = con.execute(text(f"""
               SELECT src_user_id AS source, dst_user_id AS target
               FROM graph_edges 
-              WHERE club_id=:c AND status='accepted' {time_clause}
+              WHERE club_id=:c AND status='pending' {time_clause}
             """), params).mappings().all()
 
-            pending_rows = []
-            if include_pending:
-                pending_rows = con.execute(text(f"""
-                  SELECT src_user_id AS source, dst_user_id AS target
-                  FROM graph_edges 
-                  WHERE club_id=:c AND status='pending' {time_clause}
-                """), params).mappings().all()
-
-        nodes = [dict(r) for r in nodes_rows]
-        edges = [dict(r) for r in edges_rows]
-        pending_edges = [dict(r) for r in pending_rows] if include_pending else []
-        return {"nodes": nodes, "edges": edges, "pending_edges": pending_edges}
+    nodes = [dict(r) for r in nodes_rows]
+    edges = [dict(r) for r in edges_rows]
+    pending_edges = [dict(r) for r in pending_rows] if include_pending else []
+    return {"nodes": nodes, "edges": edges, "pending_edges": pending_edges}
 
     # ===================== EVENT / BANNER / QR =====================
     def _parse_dt_local(dt_str):
@@ -1690,6 +1653,12 @@ def create_app():
             flash("E-posta gerekli.", "danger"); return redirect(url_for("verify"))
         flash("Doğrulama bağlantısı gönderildi (demo).", "success")
         return redirect(url_for("home"))
+        
+        
+     from connect_routes import bp as connections_bp
+     app.register_blueprint(connections_bp)
+        
+ 
 
     return app
 
