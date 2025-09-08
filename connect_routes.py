@@ -6,7 +6,7 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 from flask import Blueprint, request, redirect, url_for, flash, abort, session
 from sqlalchemy import text
-from .app import engine, current_user, canonical_pair, now_ts, is_member, can_interact
+from app import engine, current_user, canonical_pair, now_ts, is_member, can_interact
 
 bp = Blueprint("connections", __name__)
 
