@@ -504,7 +504,9 @@ def create_app():
         except Exception:
             if DEBUG_TRACE: traceback.print_exc()
 
-        # 2) Fallback: classic v2 API
+        # 2) Fallback: classic v2 API - GEÇICI OLARAK KAPATILDI
+        # Bu kısım eski API kullandığı için scope hatası verebilir
+        """
         try:
             if not sub:
                 me = requests.get(
@@ -535,6 +537,7 @@ def create_app():
                         pass
         except Exception:
             if DEBUG_TRACE: traceback.print_exc()
+        """
 
         if not sub:
             flash("LinkedIn kullanıcı bilgisi alınamadı. Lütfen tekrar deneyin.", "danger")
