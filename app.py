@@ -1,4 +1,4 @@
-# app.py — FULL (LinkedIn OIDC + sağlam fallback’ler + küçük teşhis uçları)
+# app.py — FIXED VERSION
 import os, io, csv, smtplib, ssl, json, time, traceback, secrets, base64, hashlib
 from email.message import EmailMessage
 from urllib.parse import urlencode, quote
@@ -47,12 +47,23 @@ def ts2human(ts):
     except Exception:
         return "-"
 
-# ----------------------- DB yardımcıları -----------------------
+# ----------------------- DB helpers -----------------------
 def is_postgres(engine) -> bool:
     return engine.dialect.name in ("postgresql", "postgres")
 
 def current_ts_sql(engine) -> str:
     return "EXTRACT(EPOCH FROM NOW())" if is_postgres(engine) else "strftime('%s','now')"
+
+def insert_with_returning(con, engine, sql_sqlite, sql_pg, params):
+    """Helper function to handle INSERT with RETURNING for both PostgreSQL and SQLite"""
+    if is_postgres(engine) and sql_pg:
+        result = con.execute(text(sql_pg), params)
+        return result.first()[0]
+    elif sql_sqlite:
+        con.execute(text(sql_sqlite), params)
+        return con.execute(text("SELECT last_insert_rowid()")).scalar()
+    else:
+        raise ValueError("No appropriate SQL provided for database type")
 
 def create_schema(engine):
     ts_default = current_ts_sql(engine)
@@ -246,7 +257,7 @@ def ensure_columns(engine):
     except Exception:
         if DEBUG_TRACE: traceback.print_exc()
 
-# ----------------------- Görsel yardımcıları -----------------------
+# ----------------------- Image helpers -----------------------
 def _is_img_filename(fname: str) -> bool:
     ext = os.path.splitext(fname or "")[1].lower()
     return ext in ALLOWED_IMG_EXT
@@ -300,7 +311,7 @@ def create_app():
     app.config["MAX_CONTENT_LENGTH"]      = 12 * 1024 * 1024
     app.config["PREFERRED_URL_SCHEME"]    = "https" if app.config["HOST_URL"].startswith("https://") else "http"
 
-    # Proksi arkasında doğru scheme/host için
+    # Behind proxy for correct scheme/host
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 
     # --- DB ---
@@ -388,201 +399,194 @@ def create_app():
             body = ctx.get("fallback_html") or "<p>Şablon eksik.</p>"
             return render_template_string(f"<!doctype html><title>{title}</title><div style='padding:20px;color:#eee;background:#111;font-family:system-ui'>{body}</div>")
 
-    # =============== Basit sağlık/diagnostic ===============
-# ===================== SAĞLIK / HESAP / OAUTH =====================
-@app.get("/health")
-def health():
-    return {"ok": True}
+    # ===================== Health / LOGOUT =====================
+    @app.get("/health")
+    def health():
+        return {"ok": True}
 
-@app.get("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("home"))
-
-@app.get("/auth/linkedin/login")
-def li_login():
-    nxt = request.args.get("next")
-    if nxt:
-        session["next_url"] = nxt
-
-    client_id = os.getenv("LINKEDIN_CLIENT_ID")
-    redirect_uri = app.config["HOST_URL"].rstrip("/") + url_for("li_callback")
-
-    state = secrets.token_urlsafe(16)
-    nonce = secrets.token_urlsafe(16)
-    session["oauth_state"] = state
-    session["oidc_nonce"] = nonce
-
-    # Eğer LinkedIn uygulamanda OIDC yoksa bu satırı:
-    # scope = "r_liteprofile r_emailaddress"
-    # yapabilirsin. OIDC açıksa aşağıdaki gibi kalsın.
-    scope = "openid profile email"
-
-    from urllib.parse import urlencode
-    params = {
-        "response_type": "code",
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "scope": scope,
-        "state": state,
-        "nonce": nonce,
-    }
-    auth_url = "https://www.linkedin.com/oauth/v2/authorization?" + urlencode(params)
-    if DEBUG_TRACE:
-        print("[DEBUG] authorize_redirect to:", redirect_uri, "| scope:", scope, "| nonce:", nonce)
-    return redirect(auth_url)
-
-@app.get("/auth/linkedin/callback")
-def li_callback():
-    if request.args.get("error"):
-        flash(f"LinkedIn yetkilendirme hatası: {request.args.get('error_description','error')}", "danger")
+    @app.get("/logout")
+    def logout():
+        session.clear()
         return redirect(url_for("home"))
 
-    state = request.args.get("state")
-    if not state or state != session.get("oauth_state"):
-        flash("CSRF uyarısı: state uyuşmuyor.", "danger")
-        return redirect(url_for("home"))
+    # ===================== LinkedIn OAuth =====================
+    @app.get("/auth/linkedin/login")
+    def li_login():
+        nxt = request.args.get("next")
+        if nxt:
+            session["next_url"] = nxt
 
-    code = request.args.get("code")
-    if not code:
-        flash("Yetkilendirme kodu alınamadı.", "danger")
-        return redirect(url_for("home"))
+        client_id = os.getenv("LINKEDIN_CLIENT_ID")
+        redirect_uri = app.config["HOST_URL"].rstrip("/") + url_for("li_callback")
 
-    token_url = "https://www.linkedin.com/oauth/v2/accessToken"
-    redirect_uri = app.config["HOST_URL"].rstrip("/") + url_for("li_callback")
-    data = {
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": redirect_uri,
-        "client_id": os.getenv("LINKEDIN_CLIENT_ID"),
-        "client_secret": os.getenv("LINKEDIN_CLIENT_SECRET"),
-    }
-    try:
-        resp = requests.post(
-            token_url, data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=20, verify=REQUESTS_VERIFY
-        )
+        state = secrets.token_urlsafe(16)
+        nonce = secrets.token_urlsafe(16)
+        session["oauth_state"] = state
+        session["oidc_nonce"] = nonce
+
+        scope = "openid profile email"
+
+        params = {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "scope": scope,
+            "state": state,
+            "nonce": nonce,
+        }
+        auth_url = "https://www.linkedin.com/oauth/v2/authorization?" + urlencode(params)
         if DEBUG_TRACE:
-            print("[DEBUG] accessToken status:", resp.status_code, "| body:", resp.text[:400])
-        if resp.status_code != 200:
-            flash("LinkedIn access token alınamadı.", "danger")
+            print("[DEBUG] authorize_redirect to:", redirect_uri, "| scope:", scope, "| nonce:", nonce)
+        return redirect(auth_url)
+
+    @app.get("/auth/linkedin/callback")
+    def li_callback():
+        if request.args.get("error"):
+            flash(f"LinkedIn yetkilendirme hatası: {request.args.get('error_description','error')}", "danger")
             return redirect(url_for("home"))
-        tok = resp.json()
-        access_token = tok.get("access_token")
-        if not access_token:
-            flash("Access token bulunamadı.", "danger")
+
+        state = request.args.get("state")
+        if not state or state != session.get("oauth_state"):
+            flash("CSRF uyarısı: state uyuşmuyor.", "danger")
             return redirect(url_for("home"))
-    except Exception:
-        if DEBUG_TRACE: traceback.print_exc()
-        flash("Token değişiminde hata oluştu.", "danger")
-        return redirect(url_for("home"))
 
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "X-Restli-Protocol-Version": "2.0.0",
-    }
+        code = request.args.get("code")
+        if not code:
+            flash("Yetkilendirme kodu alınamadı.", "danger")
+            return redirect(url_for("home"))
 
-    sub = name = email = avatar_remote = None
-
-    # 1) OIDC userinfo (OIDC açıksa)
-    try:
-        uresp = requests.get("https://api.linkedin.com/v2/userinfo", headers=headers, timeout=15, verify=REQUESTS_VERIFY)
-        if uresp.status_code == 200:
-            uj = uresp.json()
-            sub = uj.get("sub")
-            name = uj.get("name") or (uj.get("given_name","") + " " + uj.get("family_name","")).strip() or "LinkedIn User"
-            email = uj.get("email") or uj.get("emailAddress")
-            avatar_remote = uj.get("picture")
-    except Exception:
-        if DEBUG_TRACE: traceback.print_exc()
-
-    # 2) Fallback: klasik v2 API (r_liteprofile / r_emailaddress)
-    try:
-        if not sub:
-            me = requests.get(
-                "https://api.linkedin.com/v2/me?projection=(id,localizedFirstName,localizedLastName,profilePicture(displayImage~:playableStreams))",
-                headers=headers, timeout=15, verify=REQUESTS_VERIFY
+        token_url = "https://www.linkedin.com/oauth/v2/accessToken"
+        redirect_uri = app.config["HOST_URL"].rstrip("/") + url_for("li_callback")
+        data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "client_id": os.getenv("LINKEDIN_CLIENT_ID"),
+            "client_secret": os.getenv("LINKEDIN_CLIENT_SECRET"),
+        }
+        try:
+            resp = requests.post(
+                token_url, data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=20, verify=REQUESTS_VERIFY
             )
-            if me.status_code == 200:
-                mp = me.json()
-                sub = mp.get("id")
-                first = mp.get("localizedFirstName",""); last = mp.get("localizedLastName","")
-                name = (first + " " + last).strip() or name or "LinkedIn User"
-                try:
-                    pics = mp["profilePicture"]["displayImage~"]["elements"]
-                    if pics:
-                        avatar_remote = pics[-1]["identifiers"][0]["identifier"]
-                except Exception:
-                    pass
-        if not email:
-            mail = requests.get(
-                "https://www.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))",
-                headers=headers, timeout=15, verify=REQUESTS_VERIFY
-            )
-            if mail.status_code == 200:
-                mj = mail.json()
-                try:
-                    email = mj["elements"][0]["handle~"]["emailAddress"]
-                except Exception:
-                    pass
-    except Exception:
-        if DEBUG_TRACE: traceback.print_exc()
+            if DEBUG_TRACE:
+                print("[DEBUG] accessToken status:", resp.status_code, "| body:", resp.text[:400])
+            if resp.status_code != 200:
+                flash("LinkedIn access token alınamadı.", "danger")
+                return redirect(url_for("home"))
+            tok = resp.json()
+            access_token = tok.get("access_token")
+            if not access_token:
+                flash("Access token bulunamadı.", "danger")
+                return redirect(url_for("home"))
+        except Exception:
+            if DEBUG_TRACE: traceback.print_exc()
+            flash("Token değişiminde hata oluştu.", "danger")
+            return redirect(url_for("home"))
 
-    if not sub:
-        flash("LinkedIn kullanıcı bilgisi alınamadı. Lütfen tekrar deneyin.", "danger")
-        return redirect(url_for("home"))
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "X-Restli-Protocol-Version": "2.0.0",
+        }
 
-    # Kullanıcıyı oluştur/güncelle
-    with engine.begin() as con:
-        row = con.execute(text("SELECT id FROM users WHERE linkedin_id=:lid"), {"lid": sub}).first()
-        if row:
-            uid = row[0]
-            con.execute(text("UPDATE users SET name=:n WHERE id=:id"), {"n": name, "id": uid})
-        else:
-            if is_postgres(engine):
-                uid = insert_with_returning(
-                    con, engine, sql_sqlite="", sql_pg="""
-                    INSERT INTO users (linkedin_id, name, avatar_url, edu_email)
-                    VALUES (:lid, :n, NULL, :e) RETURNING id
-                    """, params={"lid": sub, "n": name, "e": email}
+        sub = name = email = avatar_remote = None
+
+        # 1) OIDC userinfo
+        try:
+            uresp = requests.get("https://api.linkedin.com/v2/userinfo", headers=headers, timeout=15, verify=REQUESTS_VERIFY)
+            if uresp.status_code == 200:
+                uj = uresp.json()
+                sub = uj.get("sub")
+                name = uj.get("name") or (uj.get("given_name","") + " " + uj.get("family_name","")).strip() or "LinkedIn User"
+                email = uj.get("email") or uj.get("emailAddress")
+                avatar_remote = uj.get("picture")
+        except Exception:
+            if DEBUG_TRACE: traceback.print_exc()
+
+        # 2) Fallback: classic v2 API
+        try:
+            if not sub:
+                me = requests.get(
+                    "https://api.linkedin.com/v2/me?projection=(id,localizedFirstName,localizedLastName,profilePicture(displayImage~:playableStreams))",
+                    headers=headers, timeout=15, verify=REQUESTS_VERIFY
                 )
+                if me.status_code == 200:
+                    mp = me.json()
+                    sub = mp.get("id")
+                    first = mp.get("localizedFirstName",""); last = mp.get("localizedLastName","")
+                    name = (first + " " + last).strip() or name or "LinkedIn User"
+                    try:
+                        pics = mp["profilePicture"]["displayImage~"]["elements"]
+                        if pics:
+                            avatar_remote = pics[-1]["identifiers"][0]["identifier"]
+                    except Exception:
+                        pass
+            if not email:
+                mail = requests.get(
+                    "https://www.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))",
+                    headers=headers, timeout=15, verify=REQUESTS_VERIFY
+                )
+                if mail.status_code == 200:
+                    mj = mail.json()
+                    try:
+                        email = mj["elements"][0]["handle~"]["emailAddress"]
+                    except Exception:
+                        pass
+        except Exception:
+            if DEBUG_TRACE: traceback.print_exc()
+
+        if not sub:
+            flash("LinkedIn kullanıcı bilgisi alınamadı. Lütfen tekrar deneyin.", "danger")
+            return redirect(url_for("home"))
+
+        # Create/update user
+        with engine.begin() as con:
+            row = con.execute(text("SELECT id FROM users WHERE linkedin_id=:lid"), {"lid": sub}).first()
+            if row:
+                uid = row[0]
+                con.execute(text("UPDATE users SET name=:n WHERE id=:id"), {"n": name, "id": uid})
             else:
                 uid = insert_with_returning(
-                    con, engine, sql_sqlite="""
+                    con, engine, 
+                    sql_sqlite="""
                     INSERT INTO users (linkedin_id, name, avatar_url, edu_email)
                     VALUES (:lid, :n, NULL, :e)
-                    """, sql_pg="", params={"lid": sub, "n": name, "e": email}
+                    """, 
+                    sql_pg="""
+                    INSERT INTO users (linkedin_id, name, avatar_url, edu_email)
+                    VALUES (:lid, :n, NULL, :e) RETURNING id
+                    """, 
+                    params={"lid": sub, "n": name, "e": email}
                 )
 
-    # Avatar'ı indir → local; olmazsa remote URL yaz
-    avatar_url_final = None
-    if avatar_remote:
-        local_path = os.path.join(AVATAR_DIR, f"{uid}.jpg")
-        ok = _download_image_to_local(avatar_remote, local_path)
-        if ok:
-            web_rel = local_path.split(os.path.join(BASE_DIR, "static"))[-1].replace("\\","/")
-            avatar_url_final = "/static" + web_rel
-    if not avatar_url_final and avatar_remote:
-        avatar_url_final = avatar_remote
+        # Download avatar to local; if fails, use remote URL
+        avatar_url_final = None
+        if avatar_remote:
+            local_path = os.path.join(AVATAR_DIR, f"{uid}.jpg")
+            ok = _download_image_to_local(avatar_remote, local_path)
+            if ok:
+                web_rel = local_path.split(os.path.join(BASE_DIR, "static"))[-1].replace("\\","/")
+                avatar_url_final = "/static" + web_rel
+        if not avatar_url_final and avatar_remote:
+            avatar_url_final = avatar_remote
 
-    with engine.begin() as con:
-        con.execute(text("UPDATE users SET avatar_url=:a, avatar_cached_at=:t WHERE id=:id"),
-                    {"a": avatar_url_final, "t": now_ts(), "id": uid})
+        with engine.begin() as con:
+            con.execute(text("UPDATE users SET avatar_url=:a, avatar_cached_at=:t WHERE id=:id"),
+                        {"a": avatar_url_final, "t": now_ts(), "id": uid})
 
-    session["uid"] = uid
-    flash("Giriş başarılı.", "success")
+        session["uid"] = uid
+        flash("Giriş başarılı.", "success")
 
-    nxt = session.get("next_url")
-    if email and allowed_edu(email):
-        return redirect(url_for("verify", next=nxt) if nxt else url_for("verify"))
-    return redirect(nxt or url_for("home"))
+        nxt = session.get("next_url")
+        if email and allowed_edu(email):
+            return redirect(url_for("verify", next=nxt) if nxt else url_for("verify"))
+        return redirect(nxt or url_for("home"))
 
     # ===================== HOME =====================
     @app.get("/")
     def home():
         user = current_user()
-        # DB erişimi başarısız olsa bile sayfa açılsın diye try:
         my_clubs = []; my_events = []; all_events = []
         try:
             with engine.begin() as con:
@@ -615,12 +619,11 @@ def li_callback():
             if DEBUG_TRACE: traceback.print_exc()
             flash(f"DB erişimi başarısız: {e}", "warning")
 
-        # DİKKAT: burada her zaman try_render kullanıyoruz
         fallback = "<h2>Home</h2><p style='opacity:.8'>Şablon bulunamadıysa bu ekran görünür.</p>"
         return try_render("home.html", user=user, my_clubs=my_clubs, my_events=my_events, all_events=all_events,
                           page_title="Anasayfa", fallback_html=fallback)
 
-    # ===================== PROFİL =====================
+    # ===================== PROFILE =====================
     @app.get("/profile")
     def profile():
         user = current_user()
@@ -650,7 +653,7 @@ def li_callback():
         return try_render("profile.html", user=user, memberships=memberships,
                           page_title="Profil", fallback_html=fallback)
 
-    # ===================== PANELLERİM =====================
+    # ===================== MY PANELS =====================
     @app.get("/panellerim")
     def my_panels():
         user = current_user()
@@ -659,7 +662,6 @@ def li_callback():
         admin_clubs = []
         try:
             with engine.begin() as con:
-                # NOT: SQLite param binding ile IN tuple için bindparams karmaşık; basit bırakıyoruz.
                 admin_clubs = con.execute(text("""
                   SELECT c.*
                   FROM club_members m 
@@ -670,13 +672,12 @@ def li_callback():
         except Exception:
             if DEBUG_TRACE: traceback.print_exc()
 
-        # HER ZAMAN try_render
         rows = "".join([f"<li>#{c['id']} · {c['name']}</li>" for c in admin_clubs]) or "<li>Yok</li>"
         fallback = f"<h2>Panellerim</h2><ul>{rows}</ul>"
         return try_render("panels.html", user=user, admin_clubs=admin_clubs,
                           page_title="Panellerim", fallback_html=fallback)
 
-    # ===================== CLUB DASHBOARD (kısaltılmadı) =====================
+    # ===================== CLUB DASHBOARD =====================
     def user_is_owner(club_id: int, user_id: int) -> bool:
         with engine.begin() as con:
             club = con.execute(text("SELECT owner_user_id FROM clubs WHERE id=:c"), {"c": club_id}).first()
@@ -722,7 +723,7 @@ def li_callback():
                           meetings=meetings, events=events, owner=owner,
                           page_title=f"{club['name']}", fallback_html=fallback)
 
-    # ===================== EVENT/ANALYTICS/QR (senin sürümündeki gibi) =====================
+    # ===================== EVENT/ANALYTICS/QR =====================
     def _parse_dt_local(dt_str):
         if not dt_str: return None
         try:
@@ -771,21 +772,19 @@ def li_callback():
             return redirect(url_for("event_new", club_id=club_id))
         qr_secret = secrets.token_urlsafe(16)
 
-        with engine.begin() as con:
-            if is_postgres(engine):
-                res = con.execute(text("""
-                  INSERT INTO events (club_id, title, category, starts_at, ends_at, qr_secret, created_by, created_at)
-                  VALUES (:c,:t,:cat,:s,:e,:q,:u,:now) RETURNING id
-                """), {"c": club_id, "t": title, "cat": category, "s": starts_at, "e": ends_at,
-                       "q": qr_secret, "u": user["id"], "now": now_ts()}).first()
-                event_id = res[0]
-            else:
-                con.execute(text("""
-                  INSERT INTO events (club_id, title, category, starts_at, ends_at, qr_secret, created_by, created_at)
-                  VALUES (:c,:t,:cat,:s,:e,:q,:u,:now)
-                """), {"c": club_id, "t": title, "cat": category, "s": starts_at, "e": ends_at,
-                       "q": qr_secret, "u": user["id"], "now": now_ts()})
-                event_id = con.execute(text("SELECT last_insert_rowid()")).scalar()
+        event_id = insert_with_returning(
+            engine.begin().__enter__(), engine,
+            sql_sqlite="""
+            INSERT INTO events (club_id, title, category, starts_at, ends_at, qr_secret, created_by, created_at)
+            VALUES (:c,:t,:cat,:s,:e,:q,:u,:now)
+            """,
+            sql_pg="""
+            INSERT INTO events (club_id, title, category, starts_at, ends_at, qr_secret, created_by, created_at)
+            VALUES (:c,:t,:cat,:s,:e,:q,:u,:now) RETURNING id
+            """,
+            params={"c": club_id, "t": title, "cat": category, "s": starts_at, "e": ends_at,
+                   "q": qr_secret, "u": user["id"], "now": now_ts()}
+        )
 
         try:
             if "banner" in request.files and request.files["banner"].filename:
@@ -912,7 +911,7 @@ def li_callback():
               INSERT OR IGNORE INTO checkins (event_id,user_id,checked_at,via_qr_secret)
               VALUES (:e,:u,:t,:q)
             """), {"e": e, "u": user["id"], "t": now_ts(), "q": q})
-        flash("Yoklamaya eklendin. Hoş geldin! 👋", "success")
+        flash("Yoklamaya eklendin. Hoş geldin!", "success")
         return redirect(url_for("event_analytics", event_id=e))
 
     @app.get("/events/<int:event_id>/qr.png")
@@ -959,178 +958,7 @@ def li_callback():
             mimetype="text/csv"
         )
 
-    # ===================== AUTH (LinkedIn OIDC) =====================
-    @app.get("/auth/linkedin/login")
-    def li_login():
-        nxt = request.args.get("next")
-        if nxt: session["next_url"] = nxt
-
-        client_id = os.getenv("LINKEDIN_CLIENT_ID")
-        redirect_uri = app.config["HOST_URL"] + url_for("li_callback")
-        state = secrets.token_urlsafe(16)
-        nonce = secrets.token_urlsafe(16)
-        session["oauth_state"] = state
-        session["oidc_nonce"]  = nonce
-
-        scope = os.getenv("LINKEDIN_SCOPE", "openid profile email")  # ÇALIŞAN sürümle aynısı
-        params = {
-            "response_type": "code",
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "scope": scope,
-            "state": state,
-            "nonce": nonce,
-        }
-        auth_url = "https://www.linkedin.com/oauth/v2/authorization?" + urlencode(params)
-        if DEBUG_TRACE:
-            print("[DEBUG] authorize_redirect to:", redirect_uri, "| scope:", scope, "| nonce:", nonce)
-            print("[DEBUG] auth_url:", auth_url)
-        return redirect(auth_url)
-
-    @app.get("/auth/linkedin/callback")
-    def li_callback():
-        if request.args.get("error"):
-            flash(f"LinkedIn yetkilendirme hatası: {request.args.get('error_description','error')}", "danger")
-            return redirect(url_for("home"))
-
-        state = request.args.get("state")
-        if not state or state != session.get("oauth_state"):
-            flash("CSRF uyarısı: state uyuşmuyor.", "danger")
-            return redirect(url_for("home"))
-
-        code = request.args.get("code")
-        if not code:
-            flash("Yetkilendirme kodu alınamadı.", "danger")
-            return redirect(url_for("home"))
-
-        token_url = "https://www.linkedin.com/oauth/v2/accessToken"
-        redirect_uri = app.config["HOST_URL"] + url_for("li_callback")
-        data = {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": redirect_uri,
-            "client_id": os.getenv("LINKEDIN_CLIENT_ID"),
-            "client_secret": os.getenv("LINKEDIN_CLIENT_SECRET"),
-        }
-        try:
-            resp = requests.post(
-                token_url, data=data,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=20, verify=REQUESTS_VERIFY
-            )
-            if DEBUG_TRACE:
-                print("[DEBUG] accessToken status:", resp.status_code, "| body:", resp.text[:400])
-            if resp.status_code != 200:
-                flash("LinkedIn access token alınamadı.", "danger")
-                return redirect(url_for("home"))
-            tok = resp.json()
-            access_token = tok.get("access_token")
-            if not access_token:
-                flash("Access token bulunamadı.", "danger")
-                return redirect(url_for("home"))
-        except Exception:
-            if DEBUG_TRACE: traceback.print_exc()
-            flash("Token değişiminde hata oluştu.", "danger")
-            return redirect(url_for("home"))
-
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "X-Restli-Protocol-Version": "2.0.0",
-        }
-
-        sub = name = email = avatar_remote = None
-        # OIDC userinfo
-        try:
-            uresp = requests.get("https://api.linkedin.com/v2/userinfo", headers=headers, timeout=15, verify=REQUESTS_VERIFY)
-            if uresp.status_code == 200:
-                uj = uresp.json()
-                sub = uj.get("sub")
-                name = uj.get("name") or (uj.get("given_name","") + " " + uj.get("family_name","")).strip() or "LinkedIn User"
-                email = uj.get("email") or uj.get("emailAddress")
-                avatar_remote = uj.get("picture")
-        except Exception:
-            if DEBUG_TRACE: traceback.print_exc()
-
-        # Fallback v2 uçları
-        try:
-            if not sub:
-                me = requests.get(
-                    "https://api.linkedin.com/v2/me?projection=(id,localizedFirstName,localizedLastName,profilePicture(displayImage~:playableStreams))",
-                    headers=headers, timeout=15, verify=REQUESTS_VERIFY
-                )
-                if me.status_code == 200:
-                    mp = me.json()
-                    sub = mp.get("id")
-                    first = mp.get("localizedFirstName",""); last = mp.get("localizedLastName","")
-                    name = (first + " " + last).strip() or name or "LinkedIn User"
-                    try:
-                        pics = mp["profilePicture"]["displayImage~"]["elements"]
-                        if pics:
-                            avatar_remote = pics[-1]["identifiers"][0]["identifier"]
-                    except Exception:
-                        pass
-            if not email:
-                mail = requests.get(
-                    "https://www.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))",
-                    headers=headers, timeout=15, verify=REQUESTS_VERIFY
-                )
-                if mail.status_code == 200:
-                    mj = mail.json()
-                    try:
-                        email = mj["elements"][0]["handle~"]["emailAddress"]
-                    except Exception:
-                        pass
-        except Exception:
-            if DEBUG_TRACE: traceback.print_exc()
-
-        if not sub:
-            flash("LinkedIn kullanıcı bilgisi alınamadı. Lütfen tekrar deneyin.", "danger")
-            return redirect(url_for("home"))
-
-        # Kullanıcı upsert
-        with engine.begin() as con:
-            row = con.execute(text("SELECT id FROM users WHERE linkedin_id=:lid"), {"lid": sub}).first()
-            if row:
-                uid = row[0]
-                con.execute(text("UPDATE users SET name=:n WHERE id=:id"), {"n": name, "id": uid})
-            else:
-                if is_postgres(engine):
-                    res = con.execute(text("""
-                        INSERT INTO users (linkedin_id, name, avatar_url, edu_email)
-                        VALUES (:lid, :n, NULL, :e) RETURNING id
-                    """), {"lid": sub, "n": name, "e": email}).first()
-                    uid = res[0]
-                else:
-                    con.execute(text("""
-                        INSERT INTO users (linkedin_id, name, avatar_url, edu_email)
-                        VALUES (:lid, :n, NULL, :e)
-                    """), {"lid": sub, "n": name, "e": email})
-                    uid = con.execute(text("SELECT last_insert_rowid()")).scalar()
-
-        # Avatar indir (opsiyonel)
-        avatar_url_final = None
-        if avatar_remote:
-            local_path = os.path.join(AVATAR_DIR, f"{uid}.jpg")
-            ok = _download_image_to_local(avatar_remote, local_path)
-            if ok:
-                web_rel = local_path.split(os.path.join(BASE_DIR, "static"))[-1].replace("\\","/")
-                avatar_url_final = "/static" + web_rel
-        if not avatar_url_final and avatar_remote:
-            avatar_url_final = avatar_remote
-
-        with engine.begin() as con:
-            con.execute(text("UPDATE users SET avatar_url=:a, avatar_cached_at=:t WHERE id=:id"),
-                        {"a": avatar_url_final, "t": now_ts(), "id": uid})
-
-        session["uid"] = uid
-        flash("Giriş başarılı.", "success")
-
-        nxt = session.get("next_url")
-        if email and allowed_edu(email):
-            return redirect(url_for("verify", next=nxt) if nxt else url_for("verify"))
-        return redirect(nxt or url_for("home"))
-
-    # ===================== Verify / Logout =====================
+    # ===================== EDU VERIFICATION =====================
     @app.get("/verify")
     def verify():
         user = current_user()
@@ -1138,12 +966,7 @@ def li_callback():
         fallback = f"<h2>EDU Doğrulama</h2><p>İzinli alanlar: {allowed or '(tanımlı değil)'}.</p>"
         return try_render("verify.html", user=user, allowed=allowed, page_title="EDU Doğrulama", fallback_html=fallback)
 
-    @app.get("/logout")
-    def logout():
-        session.clear()
-        return redirect(url_for("home"))
-
-    # =============== 500 için basit hata sayfası ===============
+    # =============== ERROR HANDLERS ===============
     @app.errorhandler(500)
     def err_500(e):
         if DEBUG_TRACE: traceback.print_exc()
@@ -1163,4 +986,3 @@ app = create_app()
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
-
