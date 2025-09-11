@@ -6,13 +6,17 @@
 
 <div class="toolbar" style="margin-bottom:16px">
   <a href="{{ url_for('club_analytics', club_id=club.id) }}">Kulüp Analizi</a>
-  {% if owner %}
+  {% if is_admin %}
     <a href="{{ url_for('event_new', club_id=club.id) }}">Yeni Etkinlik/Toplantı</a>
   {% endif %}
 </div>
 
+{# events listesini meeting ve event olarak ayır #}
+{% set meetings = events|selectattr('category','equalto','meeting')|list %}
+{% set other_events = events|rejectattr('category','equalto','meeting')|list %}
+
 <h2 class="section-title">Toplantılar</h2>
-{% if meetings %}
+{% if meetings and meetings|length > 0 %}
   <div class="grid">
     {% for e in meetings %}
       <a class="card"
@@ -31,9 +35,9 @@
 {% endif %}
 
 <h2 class="section-title">Etkinlikler</h2>
-{% if events %}
+{% if other_events and other_events|length > 0 %}
   <div class="grid">
-    {% for e in events %}
+    {% for e in other_events %}
       <a class="card"
          href="{{ url_for('event_analytics', event_id=e.id) }}"
          style="{% if e.banner_url %}background:
