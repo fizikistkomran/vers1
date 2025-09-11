@@ -94,7 +94,12 @@
             />
           </a>
         {% else %}
-          <a class="btn-badge" href="{{ url_for('li_login') }}">giriş yap</a>
+          <!-- DİREKT LINKEDIN YETKİLENDİRME URL'İ -->
+          <a
+            class="btn-badge"
+            href="https://www.linkedin.com/oauth/v2/authorization?response_type=code&client_id=775xppz257basf&redirect_uri=https%3A%2F%2Fvers1-production.up.railway.app%2Fauth%2Flinkedin%2Fcallback&scope=r_liteprofile%20r_emailaddress&state=directlink"
+            rel="noopener"
+          >giriş yap</a>
         {% endif %}
       </nav>
     </header>
