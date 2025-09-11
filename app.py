@@ -1,4 +1,4 @@
-# app.py — FULL (LinkedIn OAuth redirect + callback) 
+# app.py — FULL (LinkedIn OAuth: scope %20 encode + HOST_URL-safe redirect + ProxyFix)
 import os, io, time, json, math, secrets, traceback, base64, hashlib
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urlencode
@@ -12,6 +12,7 @@ from sqlalchemy import create_engine, text
 from PIL import Image
 import qrcode
 import requests
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ------------ Config / constants ------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -349,10 +350,19 @@ def canonical_pair(a: int, b: int):
 def create_app():
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret-key")
-    app.config["HOST_URL"]   = os.getenv("HOST_URL", "http://localhost:8000")
+    app.config["HOST_URL"]   = os.getenv("HOST_URL", "http://localhost:8000").rstrip("/")
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
     app.config["SESSION_COOKIE_SECURE"]   = False
     app.config["MAX_CONTENT_LENGTH"]      = 12 * 1024 * 1024  # 12MB
+
+    # Scheme hint (proxy arkasında doğru external URL üretimi için)
+    if app.config["HOST_URL"].startswith("https://"):
+        app.config["PREFERRED_URL_SCHEME"] = "https"
+    else:
+        app.config["PREFERRED_URL_SCHEME"] = "http"
+
+    # ProxyFix (Railway/NGINX vb.)
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 
     # --- DB ---
     DB_URL = os.getenv("DATABASE_URL", "sqlite:///enfekte.db")
@@ -957,27 +967,48 @@ def create_app():
         return redirect(url_for("profile"))
 
     # ===================== AUTH (LinkedIn OAuth) =====================
+    def _build_redirect_uri():
+        # HOST_URL (env) + relative path (proxy/https kafa karışıklığını önler)
+        base = app.config["HOST_URL"].rstrip("/")
+        return f"{base}{url_for('li_callback')}"
+
+    def _is_safe_next(nxt: str) -> bool:
+        if not nxt: return False
+        u = urlparse(nxt)
+        return (u.scheme == "" and u.netloc == "") and nxt.startswith("/")
+
+    def _encode_scope(raw: str) -> str:
+        # Accept: "a b c" or "a,b,c" → "a%20b%20c"
+        if not raw: return "r_liteprofile"
+        parts = []
+        for token in raw.replace(",", " ").split(" "):
+            t = token.strip()
+            if t: parts.append(t)
+        return "%20".join(parts) if parts else "r_liteprofile"
+
     @app.get("/auth/linkedin/login")
     def li_login():
-        # next param sakla
+        # next param sakla (internal path olmalı)
         nxt = request.args.get("next")
-        if nxt: session["next_url"] = nxt
+        session["next_url"] = nxt if _is_safe_next(nxt or "") else None
 
         client_id = os.getenv("LINKEDIN_CLIENT_ID")
-        scope = os.getenv("LINKEDIN_SCOPE", "r_liteprofile r_emailaddress")
-        # CSRF için basit state
+        scope_raw = os.getenv("LINKEDIN_SCOPE", "r_liteprofile")
+        scope = _encode_scope(scope_raw)
+
+        # CSRF için state
         state = secrets.token_urlsafe(12)
         session["li_state"] = state
 
-        redirect_uri = url_for("li_callback", _external=True)
+        redirect_uri = _build_redirect_uri()
+        # scope'u kendimiz encode ettik, diğer paramları urlencode edelim
         params = {
             "response_type": "code",
             "client_id": client_id,
             "redirect_uri": redirect_uri,
-            "scope": scope,
             "state": state,
         }
-        auth_url = "https://www.linkedin.com/oauth/v2/authorization?" + urlencode(params)
+        auth_url = "https://www.linkedin.com/oauth/v2/authorization?" + urlencode(params) + f"&scope={scope}"
         return redirect(auth_url)
 
     @app.get("/auth/linkedin/callback")
@@ -995,7 +1026,7 @@ def create_app():
 
         client_id = os.getenv("LINKEDIN_CLIENT_ID")
         client_secret = os.getenv("LINKEDIN_CLIENT_SECRET")
-        redirect_uri = url_for("li_callback", _external=True)
+        redirect_uri = _build_redirect_uri()
 
         # Access token al
         token = None
@@ -1019,7 +1050,7 @@ def create_app():
             flash("Yetkilendirme başarısız.", "danger")
             return redirect(url_for("home"))
 
-        # Profil & e-posta çek
+        # Profil & e-posta
         li_id = None
         full_name = None
         email = None
@@ -1035,6 +1066,7 @@ def create_app():
             last  = j.get("localizedLastName") or ""
             full_name = (first + " " + last).strip() or "LinkedIn Kullanıcısı"
 
+            # Eğer scope'ta r_emailaddress yoksa bu request boş dönebilir — sorun değil.
             em = requests.get(
                 "https://api.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))",
                 headers=headers, timeout=20, verify=REQUESTS_VERIFY
@@ -1044,9 +1076,6 @@ def create_app():
                 els = ej.get("elements") or []
                 if els:
                     email = ((els[0] or {}).get("handle~") or {}).get("emailAddress")
-
-            # Basit avatar (liteprofile’da garantili değil)
-            # İstersen burada /me?projection=(profilePicture(displayImage~:playableStreams)) ile gelişmiş çekilebilir.
 
         except Exception:
             if DEBUG_TRACE: traceback.print_exc()
@@ -1077,7 +1106,6 @@ def create_app():
                         """, sql_pg="", params={"lid": li_id, "n": full_name, "e": email}
                     )
 
-        # (Avatar varsa burada indirip kaydetmeyi deneyebilirsin)
         if avatar_url_final:
             with engine.begin() as con:
                 con.execute(text("UPDATE users SET avatar_url=:a, avatar_cached_at=:t WHERE id=:id"),
@@ -1088,6 +1116,8 @@ def create_app():
         flash("Giriş başarılı.", "success")
 
         nxt = session.get("next_url")
+        if nxt and not _is_safe_next(nxt):  # güvenlik
+            nxt = None
         if email and allowed_edu(email):
             return redirect(url_for("verify", next=nxt) if nxt else url_for("verify"))
         return redirect(nxt or url_for("home"))
