@@ -982,13 +982,23 @@ def create_app():
         return redirect(url_for("profile"))
 
     # ===================== AUTH (LinkedIn mock) =====================
-    @app.get("/auth/linkedin/login")
-    def li_login():
-        nxt = request.args.get("next")
-        if nxt: session["next_url"] = nxt
-        # Demo login form
-        return try_render("index.html", page_title="Giriş", HOST_URL=app.config["HOST_URL"],
-                          fallback_html="<p>LinkedIn ile giriş (demo).</p>")
+@app.get("/auth/linkedin/login")
+def li_login():
+    nxt = request.args.get("next")
+    if nxt:
+        session["next_url"] = nxt
+
+    client_id = os.getenv("LINKEDIN_CLIENT_ID")
+    redirect_uri = url_for("li_callback", _external=True)
+    scope = "r_liteprofile r_emailaddress"
+
+    auth_url = (
+        "https://www.linkedin.com/oauth/v2/authorization"
+        f"?response_type=code&client_id={client_id}"
+        f"&redirect_uri={redirect_uri}"
+        f"&scope={scope}"
+    )
+    return redirect(auth_url)
 
     @app.post("/auth/linkedin/callback")
     def li_callback():
