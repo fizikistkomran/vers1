@@ -1,7 +1,7 @@
-# app.py — full version (updated)
+# app.py — FULL (LinkedIn OAuth redirect + callback) 
 import os, io, time, json, math, secrets, traceback, base64, hashlib
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 from flask import (
     Flask, render_template, render_template_string, request, redirect,
     url_for, session, flash, abort, send_file
@@ -283,7 +283,6 @@ def ensure_columns(engine):
                 if not has_col("clubs", "logo_url"):
                     con.exec_driver_sql("ALTER TABLE clubs ADD COLUMN logo_url TEXT")
                 if not has_col("events", "banner_url"):
-                    # FIX: previously REAL; should be TEXT
                     con.exec_driver_sql("ALTER TABLE events ADD COLUMN banner_url TEXT")
                 if not has_col("events", "category"):
                     con.exec_driver_sql("ALTER TABLE events ADD COLUMN category TEXT DEFAULT 'event'")
@@ -375,7 +374,7 @@ def create_app():
         connect_args={"connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "10"))} if DB_URL.startswith("postgresql") else {},
     )
 
-    # warm up (railway cold start)
+    # warm up
     attempts = int(os.getenv("DB_CONNECT_ATTEMPTS", "5"))
     delay = 1.0
     last_err = None
@@ -580,7 +579,6 @@ def create_app():
               SELECT * FROM events WHERE club_id=:c ORDER BY COALESCE(starts_at, created_at) DESC LIMIT 24
             """), {"c": club_id}).mappings().all()
 
-        # enrich connection_status for each member relative to current user
         enriched = []
         for m in members:
             if m["user_id"] == user["id"]:
@@ -608,7 +606,6 @@ def create_app():
                           page_title=f"{club['name']} • Kulüp",
                           fallback_html="<h2>Kulüp</h2>")
 
-    # Uploads for club (banner/logo)
     @app.post("/clubs/<int:club_id>/banner")
     def club_upload_banner(club_id):
         user = current_user()
@@ -629,29 +626,22 @@ def create_app():
             flash(f"Görsel yüklenemedi: {e}", "danger")
         return redirect(url_for("club_dashboard", club_id=club_id))
 
-    # ===================== GRAPH (club) =====================
+    # ===================== GRAPH =====================
     @app.get("/clubs/<int:club_id>/graph")
     def club_graph(club_id):
         user = current_user()
         if not user: return redirect(url_for("li_login", next=request.url))
         if not is_admin_or_owner(club_id, user["id"]): return abort(403)
-        # simple wrapper: template uses iframe for embed
         with engine.begin() as con:
             club = con.execute(text("SELECT * FROM clubs WHERE id=:id"), {"id": club_id}).mappings().first()
         max_ts = now_ts()
-        return try_render("club_graph_embed.html", club=club, club_id=club_id, max_ts=max_ts,
+        return try_render("community_graph.html", club=club, club_id=club_id, max_ts=max_ts,
                           page_title="Kulüp Ağı", fallback_html="<h3>Kulüp Ağı</h3>")
-
-    @app.get("/clubs/<int:club_id>/graph.embed")
-    def club_graph_embed(club_id):
-        # same as /graph, just alt route
-        return redirect(url_for("club_graph", club_id=club_id))
 
     @app.get("/clubs/<int:club_id>/graph.json")
     def club_graph_json(club_id):
         user = current_user()
         if not user: return abort(401)
-        # optionally filter by time/pending
         try:
             max_time = float(request.args.get("max_time", "1e20"))
         except Exception:
@@ -659,13 +649,11 @@ def create_app():
         show_pending = request.args.get("pending") == "1"
 
         with engine.begin() as con:
-            # nodes = all club members
             nodes = con.execute(text("""
               SELECT u.id AS id, u.name AS label, u.avatar_url AS avatar
               FROM club_members m JOIN users u ON u.id=m.user_id
               WHERE m.club_id=:c
             """), {"c": club_id}).mappings().all()
-            # edges = accepted or pending depending filter
             if show_pending:
                 edges = con.execute(text("""
                   SELECT src_user_id AS s, dst_user_id AS d, status
@@ -685,7 +673,6 @@ def create_app():
     def _parse_dt_local(s):
         if not s: return None
         try:
-            # HTML datetime-local -> timestamp (assume local tz)
             dt = datetime.fromisoformat(s)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
@@ -755,12 +742,11 @@ def create_app():
         if not user: return redirect(url_for("li_login", next=request.url))
         with engine.begin() as con:
             ev = con.execute(text("""
-              SELECT e.*, c.name AS club_name FROM events e JOIN clubs c ON c.id=e.club_id
+              SELECT e.*, c.name AS club_name, c.id AS club_id FROM events e JOIN clubs c ON c.id=e.club_id
               WHERE e.id=:id
             """), {"id": event_id}).mappings().first()
             if not ev: return abort(404)
 
-            # participants
             attendees = con.execute(text("""
               SELECT u.id, u.name, u.avatar_url, u.edu_email, ch.checked_at
               FROM checkins ch 
@@ -775,7 +761,6 @@ def create_app():
             """), {"c": ev["club_id"]}).scalar() or 0
             att_rate = (total_att*100.0/member_count) if member_count else 0.0
             edu_verified_count = sum(1 for a in attendees if a.get("edu_email"))
-            # continuation heuristic: next event of same club within 60 days and same attendees
             cont = con.execute(text("""
               SELECT COUNT(DISTINCT ch2.user_id) 
               FROM events e2 
@@ -791,7 +776,6 @@ def create_app():
                           edu_verified_count=edu_verified_count, continued=continued, cont_rate=cont_rate,
                           page_title=f"{ev['title']} • Analiz", fallback_html="<h3>Etkinlik Analiz</h3>")
 
-    # JOIN via QR
     @app.get("/join")
     def join():
         e = request.args.get("e", type=int)
@@ -821,7 +805,6 @@ def create_app():
         flash("Yoklamaya eklendin. Hoş geldin! 👋", "success")
         return redirect(url_for("event_analytics", event_id=e))
 
-    # Live QR + PNG
     @app.get("/events/<int:event_id>/live")
     def event_live(event_id):
         user = current_user()
@@ -847,7 +830,7 @@ def create_app():
         buf.seek(0)
         return send_file(buf, mimetype="image/png")
 
-    # ===================== CONNECTIONS (Global routes to match templates) =====================
+    # ===================== CONNECTIONS =====================
     @app.post("/connect/request/<int:uid>")
     def connect_request(uid):
         user = current_user()
@@ -855,7 +838,6 @@ def create_app():
         if uid == user["id"]:
             flash("Kendinle bağlantı olmaz 🤝", "warning"); return redirect(request.referrer or url_for("home"))
 
-        # find a mutual club
         with engine.begin() as con:
             mutual = con.execute(text("""
               SELECT c1.club_id
@@ -883,19 +865,16 @@ def create_app():
                     if row["requested_by"] == user["id"]:
                         flash("İstek zaten gönderilmiş.", "info")
                     else:
-                        # karşıdan gelmiş bekleyen istek => kabul edelim
                         con.execute(text("""
                           UPDATE graph_edges SET status='accepted', responded_at=:t WHERE id=:id
                         """), {"t": now_ts(), "id": row["id"]})
                         flash("Bağlantı kabul edildi 🎉", "success")
                 elif row["status"] == "declined":
-                    # yeniden pending'e çekebiliriz
                     con.execute(text("""
                       UPDATE graph_edges SET status='pending', requested_by=:u, responded_at=NULL WHERE id=:id
                     """), {"u": user["id"], "id": row["id"]})
                     flash("Bağlantı isteği tekrar gönderildi.", "success")
             else:
-                # create pending
                 insert_ignore_or_conflict(
                     con, engine, "graph_edges",
                     ["club_id","src_user_id","dst_user_id","status","requested_by","created_at"],
@@ -913,18 +892,15 @@ def create_app():
         if not user:
             session["next_url"] = request.url
             return redirect(url_for("li_login"))
-        # allow viewing others: ?uid=...
         view_uid = request.args.get("uid", type=int) or user["id"]
         with engine.begin() as con:
             profile_user = con.execute(text("SELECT * FROM users WHERE id=:id"), {"id": view_uid}).mappings().first()
             if not profile_user: return abort(404)
-            # memberships of profile user
             memberships = con.execute(text("""
-              SELECT c.* FROM clubs c JOIN club_members m ON m.club_id=c.id
+              SELECT c.*, m.role FROM clubs c JOIN club_members m ON m.club_id=c.id
               WHERE m.user_id=:u ORDER BY c.created_at DESC
             """), {"u": view_uid}).mappings().all()
 
-        # compute connection status between user and profile_user across mutual clubs
         connection_status = None
         if view_uid != user["id"]:
             with engine.begin() as con:
@@ -935,7 +911,6 @@ def create_app():
                   JOIN club_members m2 ON m2.club_id=ge.club_id AND m2.user_id=:other
                   WHERE (ge.src_user_id=:s AND ge.dst_user_id=:d) OR (ge.src_user_id=:d AND ge.dst_user_id=:s)
                 """), {"me": user["id"], "other": view_uid, "s": min(user["id"], view_uid), "d": max(user["id"], view_uid)}).mappings().all()
-            # reduce
             st = None; req_by = None
             for r in rows:
                 if r["status"] == "accepted": st, req_by = "accepted", r["requested_by"]; break
@@ -981,69 +956,135 @@ def create_app():
         flash("Profil güncellendi.", "success")
         return redirect(url_for("profile"))
 
-    # ===================== AUTH (LinkedIn mock) =====================
-@app.get("/auth/linkedin/login")
-def li_login():
-    nxt = request.args.get("next")
-    if nxt:
-        session["next_url"] = nxt
+    # ===================== AUTH (LinkedIn OAuth) =====================
+    @app.get("/auth/linkedin/login")
+    def li_login():
+        # next param sakla
+        nxt = request.args.get("next")
+        if nxt: session["next_url"] = nxt
 
-    client_id = os.getenv("LINKEDIN_CLIENT_ID")
-    redirect_uri = url_for("li_callback", _external=True)
-    scope = "r_liteprofile r_emailaddress"
+        client_id = os.getenv("LINKEDIN_CLIENT_ID")
+        scope = os.getenv("LINKEDIN_SCOPE", "r_liteprofile r_emailaddress")
+        # CSRF için basit state
+        state = secrets.token_urlsafe(12)
+        session["li_state"] = state
 
-    auth_url = (
-        "https://www.linkedin.com/oauth/v2/authorization"
-        f"?response_type=code&client_id={client_id}"
-        f"&redirect_uri={redirect_uri}"
-        f"&scope={scope}"
-    )
-    return redirect(auth_url)
+        redirect_uri = url_for("li_callback", _external=True)
+        params = {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "scope": scope,
+            "state": state,
+        }
+        auth_url = "https://www.linkedin.com/oauth/v2/authorization?" + urlencode(params)
+        return redirect(auth_url)
 
-    @app.post("/auth/linkedin/callback")
+    @app.get("/auth/linkedin/callback")
     def li_callback():
-        # Demo: form fields: name, email, avatar_remote
-        name = (request.form.get("name") or "Kullanıcı").strip()
-        email = (request.form.get("email") or "").strip()
-        avatar_remote = (request.form.get("avatar_remote") or "").strip()
-        sub = hashlib.sha256((email or name).encode("utf-8")).hexdigest()[:32]
+        err = request.args.get("error")
+        if err:
+            flash(f"LinkedIn hatası: {err}", "danger")
+            return redirect(url_for("home"))
 
+        code = request.args.get("code")
+        state = request.args.get("state")
+        if not code or not state or state != session.get("li_state"):
+            flash("Geçersiz veya eksik OAuth yanıtı.", "danger")
+            return redirect(url_for("home"))
+
+        client_id = os.getenv("LINKEDIN_CLIENT_ID")
+        client_secret = os.getenv("LINKEDIN_CLIENT_SECRET")
+        redirect_uri = url_for("li_callback", _external=True)
+
+        # Access token al
+        token = None
+        try:
+            data = {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+                "client_secret": client_secret,
+            }
+            tok = requests.post("https://www.linkedin.com/oauth/v2/accessToken", data=data, timeout=20, verify=REQUESTS_VERIFY)
+            tok.raise_for_status()
+            token = tok.json().get("access_token")
+        except Exception as e:
+            if DEBUG_TRACE: traceback.print_exc()
+            flash("Token alınamadı.", "danger")
+            return redirect(url_for("home"))
+
+        if not token:
+            flash("Yetkilendirme başarısız.", "danger")
+            return redirect(url_for("home"))
+
+        # Profil & e-posta çek
+        li_id = None
+        full_name = None
+        email = None
+        avatar_url_final = None
+        try:
+            headers = {"Authorization": f"Bearer {token}"}
+
+            me = requests.get("https://api.linkedin.com/v2/me", headers=headers, timeout=20, verify=REQUESTS_VERIFY)
+            me.raise_for_status()
+            j = me.json()
+            li_id = j.get("id")
+            first = j.get("localizedFirstName") or ""
+            last  = j.get("localizedLastName") or ""
+            full_name = (first + " " + last).strip() or "LinkedIn Kullanıcısı"
+
+            em = requests.get(
+                "https://api.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))",
+                headers=headers, timeout=20, verify=REQUESTS_VERIFY
+            )
+            if em.ok:
+                ej = em.json()
+                els = ej.get("elements") or []
+                if els:
+                    email = ((els[0] or {}).get("handle~") or {}).get("emailAddress")
+
+            # Basit avatar (liteprofile’da garantili değil)
+            # İstersen burada /me?projection=(profilePicture(displayImage~:playableStreams)) ile gelişmiş çekilebilir.
+
+        except Exception:
+            if DEBUG_TRACE: traceback.print_exc()
+
+        if not li_id:
+            flash("Profil bilgisi alınamadı.", "danger")
+            return redirect(url_for("home"))
+
+        # Kullanıcıyı oluştur/güncelle
         with engine.begin() as con:
-            row = con.execute(text("SELECT id FROM users WHERE linkedin_id=:lid"), {"lid": sub}).first()
+            row = con.execute(text("SELECT id FROM users WHERE linkedin_id=:lid"), {"lid": li_id}).first()
             if row:
                 uid = row[0]
-                con.execute(text("UPDATE users SET name=:n WHERE id=:id"), {"n": name, "id": uid})
+                con.execute(text("UPDATE users SET name=:n WHERE id=:id"), {"n": full_name, "id": uid})
             else:
                 if is_postgres(engine):
                     uid = insert_with_returning(
                         con, engine, sql_sqlite="", sql_pg="""
                         INSERT INTO users (linkedin_id, name, avatar_url, edu_email)
                         VALUES (:lid, :n, NULL, :e) RETURNING id
-                        """, params={"lid": sub, "n": name, "e": email}
+                        """, params={"lid": li_id, "n": full_name, "e": email}
                     )
                 else:
                     uid = insert_with_returning(
                         con, engine, sql_sqlite="""
                         INSERT INTO users (linkedin_id, name, avatar_url, edu_email)
                         VALUES (:lid, :n, NULL, :e)
-                        """, sql_pg="", params={"lid": sub, "n": name, "e": email}
+                        """, sql_pg="", params={"lid": li_id, "n": full_name, "e": email}
                     )
 
-        avatar_url_final = None
-        if avatar_remote:
-            local_path = os.path.join(AVATAR_DIR, f"{uid}.jpg")
-            ok = _download_image_to_local(avatar_remote, local_path)
-            if ok:
-                web_rel = local_path.split(os.path.join(BASE_DIR, "static"))[-1].replace("\\","/")
-                avatar_url_final = "/static" + web_rel
-        if not avatar_url_final and avatar_remote:
-            avatar_url_final = avatar_remote
-
-        with engine.begin() as con:
-            con.execute(text("UPDATE users SET avatar_url=:a, avatar_cached_at=:t WHERE id=:id"),
-                        {"a": avatar_url_final, "t": now_ts(), "id": uid})
+        # (Avatar varsa burada indirip kaydetmeyi deneyebilirsin)
+        if avatar_url_final:
+            with engine.begin() as con:
+                con.execute(text("UPDATE users SET avatar_url=:a, avatar_cached_at=:t WHERE id=:id"),
+                            {"a": avatar_url_final, "t": now_ts(), "id": uid})
 
         session["uid"] = uid
+        session.pop("li_state", None)
         flash("Giriş başarılı.", "success")
 
         nxt = session.get("next_url")
@@ -1076,7 +1117,6 @@ def li_login():
         return {"ok": True}
 
     return app
-
 
 app = create_app()
 
